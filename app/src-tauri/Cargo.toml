@@ -1,0 +1,21 @@
+[package]
+name = "summa"
+version = "0.4.0"
+description = "Summa — AI 文献管理"
+authors = ["ismethr"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ismethr/summa"
+
+[lib]
+name = "summa_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }

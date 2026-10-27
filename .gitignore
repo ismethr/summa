@@ -1,0 +1,40 @@
+# 依赖
+node_modules/
+
+# 前端构建产物
+dist/
+dist-ssr/
+*.local
+
+# Rust 构建产物
+app/src-tauri/target/
+app/src-tauri/gen/
+
+# 打包输出
+*.dmg
+*.msi
+*.deb
+*.AppImage
+
+# 本机数据与密钥 —— 绝不入库
+config.json
+library.json
+inbox/
+*.db
+*.db-journal
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 编辑器与本地配置
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# 个人工作记忆
+.workbuddy/
+.claude/
+
+# 临时文件
+*.log
