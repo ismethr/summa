@@ -31,7 +31,7 @@ npm run tauri build
 cp -R src-tauri/target/release/bundle/macos/Summa.app ~/Applications/
 ```
 
-构建产物同时会生成 `Summa.app` 与 `Summa.dmg`，都在 `src-tauri/target/release/bundle/` 下。
+构建产物在 `app/src-tauri/target/release/bundle/macos/Summa.app`。
 
 装好之后，应用位置：
 

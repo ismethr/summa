@@ -56,8 +56,14 @@ wenxian/
 ```bash
 cd app
 npm install
-npm start          # 开发模式，改界面即时热更新
-npm run tauri build   # 打包到 src-tauri/target/release/bundle/
+npm start             # 开发模式，改界面即时热更新
+npm run tauri build   # 打包，产物在 src-tauri/target/release/bundle/
+```
+
+Windows 上打包需要显式指定安装包格式（配置里默认只出 macOS 的 `.app`）：
+
+```bash
+npm run tauri build -- --bundles nsis
 ```
 
 首次打开后点右上角「未配置 API Key」，填入自己的 DeepSeek Key（也可在设置里填），然后就可以把 PDF 拖进窗口了。详细步骤见[使用手册](app/INSTALL.md)。
