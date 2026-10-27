@@ -21,7 +21,19 @@
 
 ## 1. 安装与打开
 
-应用位置：
+目前没有发布预编译的安装包，需要从源码构建一次（只需做一次）：
+
+```bash
+git clone https://github.com/ismethr/summa.git
+cd summa/app
+npm install
+npm run tauri build
+cp -R src-tauri/target/release/bundle/macos/Summa.app ~/Applications/
+```
+
+构建产物同时会生成 `Summa.app` 与 `Summa.dmg`，都在 `src-tauri/target/release/bundle/` 下。
+
+装好之后，应用位置：
 
 ```
 ~/Applications/Summa.app
@@ -254,7 +266,12 @@ Summa 本身免费，费用来自 DeepSeek 的 API 调用，直接从你的 Deep
 从源码重新打包并替换（约 1–2 分钟）：
 
 ```bash
-cd ~/Claude/wenxian/app && npm run tauri build && rm -rf ~/Applications/Summa.app && cp -R src-tauri/target/release/bundle/macos/Summa.app ~/Applications/
+cd summa/app
+git pull
+npm install          # 依赖有变化时才需要
+npm run tauri build
+rm -rf ~/Applications/Summa.app
+cp -R src-tauri/target/release/bundle/macos/Summa.app ~/Applications/
 ```
 
 更新前先 `⌘ Q` 退出 Summa。文献数据不在应用里，更新不会丢失。
