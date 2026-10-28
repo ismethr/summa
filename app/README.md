@@ -94,7 +94,8 @@ app/
 │   └── sample.json      浏览器预览用的样例
 │
 └── src-tauri/
-    ├── src/lib.rs       ★ 全部 Rust 代码：数据结构、命令、模型调用、导入、测试
+    ├── src/lib.rs       ★ 数据结构、命令、模型调用、导入、测试
+    ├── src/sync.rs      WebDAV 同步：合并规则、HTTP、PDF 传输
     ├── tauri.conf.json  窗口、打包、版本号
     ├── capabilities/    前端可调用的系统权限
     ├── Cargo.toml       Rust 依赖
@@ -107,9 +108,10 @@ app/
 
 | 文件 | 内容 | 谁写 |
 |---|---|---|
-| `library.json` | `{ "papers": [Paper, ...] }`，新的在前 | 只有应用 |
+| `library.json` | `{ "papers": [Paper, ...], "tombstones": [...] }`，新的在前 | 只有应用 |
 | `files/<id>.pdf` | 解析或导入时复制进来的 PDF | 只有应用 |
-| `config.json` | `{ "api_key": "...", "model": "deepseek-flash" }` | 应用设置窗口 |
+| `config.json` | `{ "api_key": "...", "model": "...", "webdav": {...} }` | 应用设置窗口 |
+| `sync-state.json` | 上次同步的 ETag、内容指纹、时间 | 同步命令 |
 | `inbox/*.json` | 外部工具提交的待导入数据 | `summa.py` |
 | `inbox/failed/` | 格式有误的文件和对应的 `.error.txt` | 应用 |
 
@@ -133,12 +135,13 @@ app/
 | `note` | string | 用户笔记 |
 | `doi` | string | 规范化后的 DOI（小写、去掉 `https://doi.org/`） |
 | `origin` | string | 空 = 拖入解析；`workbuddy` 等 = 外部导入 |
+| `rev` | number | 修订时间（毫秒），同步时判新旧用。**不要手写**，`commit_library` 会自动刷 |
 
 所有字段都带 `#[serde(default)]`，旧版本写的 `library.json` 缺字段也能读。模型返回的字段用 `lenient_*` 系列函数宽容解析：`null`、数字、数组形式的作者、`"2025年"` 这类年份都能正确转换。
 
 ## Rust 命令
 
-全部在 `src-tauri/src/lib.rs`，前端用 `invoke("命令名", { 参数 })` 调用（参数名 Rust 用 snake_case，前端用 camelCase，Tauri 自动转换）。
+同步相关命令在 `src-tauri/src/sync.rs`，其余在 `lib.rs`。前端用 `invoke("命令名", { 参数 })` 调用（参数名 Rust 用 snake_case，前端用 camelCase，Tauri 自动转换）。
 
 | 命令 | 参数 | 返回 | 作用 |
 |---|---|---|---|
@@ -154,8 +157,28 @@ app/
 | `get_settings` | — | `Settings` | Key 只返回打码版本 |
 | `save_settings` | `apiKey, model` | `Settings` | `apiKey` 为 null 表示不修改 |
 | `test_connection` | `apiKey` | 模型名列表 | 请求 `/models` 验证 Key；`apiKey` 为 null 时测已保存的 |
+| `get_sync_settings` | — | `SyncSettings` | 密码只返回末两位打码 |
+| `save_sync_settings` | `url, username, password, insecure, enabled, auto` | `SyncSettings` | `password` 为 null 表示不修改，空串表示清除 |
+| `test_sync` | — | string | 建目录并读一次远端库，回报已有多少篇 |
+| `sync_now` | — | `SyncReport` | 完整同步；进度通过 `summa://sync` 事件推送 |
 
 **加一个新命令**，固定三步：写 `#[tauri::command] fn xxx(...)` → 加进 `run()` 里的 `generate_handler![...]` → 前端 `invoke("xxx", {...})`。如果用到窗口等系统能力，还要在 `capabilities/default.json` 加权限。
+
+写库一律用 `commit_library(app, &old, &mut new)`，不要直接 `write_library`。前者会逐篇比对并刷新 `rev`，同步靠它判断哪边更新；绕过它，那台机器上的修改就会被另一台的旧数据覆盖。
+
+## 同步
+
+规则与取舍见 [docs/03-sync-spec.md](../docs/03-sync-spec.md)。改这块前请先看第 2 节，四条规则缺一条就会出现丢数据或删除复活。
+
+对真实 WebDAV 服务验证 HTTP 语义（默认跳过，需要显式给地址）：
+
+```bash
+pip install wsgidav cheroot
+python3 -m wsgidav.server.server_cli --host=127.0.0.1 --port=8099 --root=/tmp/davroot --auth=anonymous
+cd src-tauri && SUMMA_DAV_TEST_URL=http://127.0.0.1:8099 cargo test webdav
+```
+
+之所以要实跑：`MKCOL` 的「已存在」状态码、`HEAD` 是否返回 `ETag`、`If-Match` 冲突是否给 412，各家实现不同，编译期和纯单元测试都看不出来。
 
 ## 解析流程
 

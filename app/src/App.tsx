@@ -1,7 +1,8 @@
 import { type MouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import type { ImportResult, Library, Paper, Settings } from "./types";
+import type { ImportResult, Library, Paper, Settings, SyncReport, SyncSettings } from "./types";
 import { renderPdf } from "./parse";
 import SettingsDialog from "./Settings";
 import Detail, { type PaperChanges } from "./Detail";
@@ -32,6 +33,15 @@ function inView(p: Paper, view: View) {
   return true;
 }
 
+function lastSyncText(ts: number) {
+  if (!ts) return "未同步";
+  const d = Date.now() - ts;
+  if (d < 60_000) return "刚刚";
+  if (d < 3600_000) return `${Math.floor(d / 60_000)} 分钟前`;
+  if (d < 86400_000) return `${Math.floor(d / 3600_000)} 小时前`;
+  return `${Math.floor(d / 86400_000)} 天前`;
+}
+
 /** 搜索时比对的文本：题名、作者、期刊、主题、要旨、方法、笔记 */
 function haystack(p: Paper) {
   return [p.title, p.authors, p.venue, String(p.year || ""), p.gist, p.note ?? "", ...p.tags, ...p.steps.map((s) => s.name)]
@@ -56,6 +66,9 @@ export default function App() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState("");
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [sync, setSync] = useState<SyncSettings | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncStage, setSyncStage] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const { theme, choice, setChoice } = useTheme();
   const searchRef = useRef<HTMLInputElement>(null);
@@ -122,6 +135,55 @@ export default function App() {
     const t = setTimeout(() => setToast(""), 5000);
     return () => clearTimeout(t);
   }, [toast]);
+
+  // ---------- 同步 ----------
+
+  // 用 ref 而不是 state 判重入：同一个 tick 里连点两次时，state 还是旧值
+  const syncBusy = useRef(false);
+
+  async function runSync(silent = false) {
+    if (syncBusy.current) return;
+    syncBusy.current = true;
+    setSyncing(true);
+    setSyncStage("正在连接");
+    try {
+      const r = await invoke<SyncReport>("sync_now");
+      if (r.library) setPapers(r.library.papers);
+      setSync(await invoke<SyncSettings>("get_sync_settings"));
+      // 静默同步（启动时自动跑）只在真有变化时提示，
+      // 否则每次开应用都弹一句"已是最新"，很快就会变成噪音
+      const changed = r.added || r.updated || r.deleted || r.pdf_up || r.pdf_down;
+      if (!silent || changed) setToast(r.message);
+    } catch (e) {
+      setToast(String(e));
+    } finally {
+      syncBusy.current = false;
+      setSyncing(false);
+      setSyncStage("");
+    }
+  }
+
+  // 启动时读同步配置；开了自动同步就先跑一次
+  useEffect(() => {
+    if (!isTauri) return;
+    invoke<SyncSettings>("get_sync_settings")
+      .then((s) => {
+        setSync(s);
+        if (s.enabled && s.auto) runSync(true);
+      })
+      .catch(() => {});
+  }, []);
+
+  // 同步进度：PDF 多的时候要跑几分钟，没有反馈用户会以为卡死
+  useEffect(() => {
+    if (!isTauri) return;
+    const un = listen<{ detail?: string }>("summa://sync", (e) => {
+      if (e.payload?.detail) setSyncStage(e.payload.detail);
+    });
+    return () => {
+      un.then((off) => off()).catch(() => {});
+    };
+  }, []);
 
   function showError(name: string, e: unknown) {
     setJob({ name, stage: "操作失败", pct: 100, error: String(e), queued: 0 });
@@ -534,6 +596,18 @@ export default function App() {
           </div>
 
           <div className="local-card">
+            {isTauri && sync?.enabled && (
+              <div
+                className="nav-item sync-item"
+                onClick={() => runSync()}
+                title={syncing ? "正在同步" : "点击立即同步"}
+              >
+                同步
+                <span className={"sync-state" + (syncing ? " busy" : "")}>
+                  {syncing ? syncStage || "同步中…" : lastSyncText(sync.last_sync)}
+                </span>
+              </div>
+            )}
             {isTauri && (
               <div className="nav-item" onClick={() => setShowSettings(true)}>
                 设置
@@ -676,9 +750,13 @@ export default function App() {
       {showSettings && settings && (
         <SettingsDialog
           settings={settings}
+          sync={sync}
+          syncing={syncing}
           theme={choice}
           onTheme={setChoice}
           onSaved={setSettings}
+          onSyncSaved={setSync}
+          onSync={() => runSync()}
           onClose={() => setShowSettings(false)}
         />
       )}

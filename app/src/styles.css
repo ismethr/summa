@@ -859,6 +859,75 @@ p.sec-p {
 
 .settings {
   width: 480px;
+  max-height: 86vh;
+  overflow-y: auto;
+}
+
+/* 同步区块的分隔标题 */
+.set-sec {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  margin: 4px 0 14px;
+  padding-top: 16px;
+  border-top: 0.5px solid var(--line);
+}
+
+.set-note {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--ink3);
+  margin-bottom: 14px;
+}
+
+.field-row {
+  display: flex;
+  gap: 10px;
+}
+
+.field-row > .field {
+  flex: 1;
+  min-width: 0;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--ink2);
+  cursor: pointer;
+  margin-bottom: 11px;
+}
+
+.check input {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.check-h {
+  font-size: 11px;
+  color: var(--ink3);
+}
+
+.sync-test-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.sync-item .sync-state {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--ink3);
+  font-variant-numeric: tabular-nums;
+}
+
+.sync-item .sync-state.busy {
+  color: var(--accent);
 }
 
 .set-title {

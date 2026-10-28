@@ -4,11 +4,15 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
+mod sync;
+
 const MAX_PAGES: usize = 12;
 /// DeepSeek 官方说明：deepseek-flash 即 V4.1 Flash，支持图像输入；v4-pro 不支持图像
 const DEFAULT_MODEL: &str = "deepseek-flash";
 const API_BASE: &str = "https://api.deepseek.com";
 const MAX_PDF_BYTES: u64 = 80 * 1024 * 1024;
+/// 墓碑上限。每条只有几十字节，留一千条足够覆盖多端来回同步的窗口期。
+const MAX_TOMBSTONES: usize = 1000;
 
 /// 文献库读写锁。连续拖入多篇时，几次 parse_pdf 会同时"读-改-写" library.json，
 /// 不加锁的话后写的会把先写的冲掉。
@@ -149,6 +153,10 @@ pub struct Paper {
     /// 记录来自哪里：空 = 拖入解析；workbuddy / claude-code 等 = 外部工具导入
     #[serde(default)]
     pub origin: String,
+    /// 修订时间（毫秒）。同步时同一篇以 rev 更大的一侧为准。
+    /// 老数据没有这个字段，合并时用 `added` 兜底，见 `sheet_rev`。
+    #[serde(default)]
+    pub rev: u64,
 }
 
 /// 界面上可以手动修改的字段；None 表示不改
@@ -160,10 +168,23 @@ pub struct PaperPatch {
     note: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
-struct Library {
+/// 删除标记。多端同步时，一台机器删掉的文献如果不留标记，
+/// 另一台机器下次同步会把它当成「只存在于远端」再传回来，也就是复活。
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct Tombstone {
     #[serde(default)]
-    papers: Vec<Paper>,
+    pub id: String,
+    #[serde(default)]
+    pub at: u64,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub(crate) struct Library {
+    #[serde(default)]
+    pub(crate) papers: Vec<Paper>,
+    /// 已删除文献的墓碑，同步时取并集；超过上限会自动裁剪
+    #[serde(default)]
+    pub(crate) tombstones: Vec<Tombstone>,
 }
 
 // ---------- 工具 ----------
@@ -204,6 +225,40 @@ fn now_stamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// 合并同一篇文献时的先后依据。老数据没有 rev，用入库时间兜底；
+/// 两者都是毫秒时间戳，可以直接比大小。
+fn sheet_rev(p: &Paper) -> u64 {
+    p.rev.max(p.added)
+}
+
+/// 逐篇对比 old 与 new，内容有变化的刷新 rev。
+///
+/// rev 只在这里写，是为了让"同步判新旧"这件事只有一个入口：
+/// 各个命令各自记得更新 rev 的话，早晚会漏掉一处，而漏掉的表现是
+/// 「这台机器上的修改在另一台机器上被旧数据覆盖」，很难查。
+fn bump_changed(old: &Library, new: &mut Library) {
+    use std::collections::HashMap;
+    let prev: HashMap<&str, &Paper> = old.papers.iter().map(|p| (p.id.as_str(), p)).collect();
+    let now = now_stamp();
+    for p in new.papers.iter_mut() {
+        let unchanged = prev
+            .get(p.id.as_str())
+            .map(|o| {
+                serde_json::to_string(o).ok().zip(serde_json::to_string(p).ok()).is_some_and(|(a, b)| a == b)
+            })
+            .unwrap_or(false);
+        if !unchanged {
+            p.rev = now;
+        }
+    }
+}
+
+/// 所有写库操作都走这里：先刷 rev，再落盘。
+fn commit_library(app: &tauri::AppHandle, old: &Library, new: &mut Library) -> Result<(), String> {
+    bump_changed(old, new);
+    write_library(app, new)
 }
 
 // ---------- 设置 ----------
@@ -352,6 +407,7 @@ async fn parse_pdf(
 
     let _guard = LIBRARY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut lib = read_library(&app)?;
+    let old = lib.clone();
 
     // 同一个文件再拖一次：沿用原来的 id，覆盖旧记录
     let existing = lib.papers.iter().position(|p| !p.source.is_empty() && p.source == path);
@@ -378,8 +434,10 @@ async fn parse_pdf(
     if let Some(i) = existing {
         lib.papers.remove(i);
     }
+    // 这篇之前可能被删过，重新拖进来就撤掉墓碑，否则下次同步又会被删掉
+    lib.tombstones.retain(|t| t.id != paper.id);
     lib.papers.insert(0, paper.clone());
-    write_library(&app, &lib)?;
+    commit_library(&app, &old, &mut lib)?;
 
     Ok(paper)
 }
@@ -389,10 +447,21 @@ async fn parse_pdf(
 fn delete_papers(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String> {
     let _guard = LIBRARY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut lib = read_library(&app)?;
+    let old = lib.clone();
     let (removed, kept): (Vec<Paper>, Vec<Paper>) =
         lib.papers.into_iter().partition(|p| ids.contains(&p.id));
     lib.papers = kept;
-    write_library(&app, &lib)?;
+    // 留墓碑：否则另一台机器下次同步会把这些文献当成"远端独有"再传回来
+    let now = now_stamp();
+    for p in &removed {
+        lib.tombstones.retain(|t| t.id != p.id);
+        lib.tombstones.push(Tombstone { id: p.id.clone(), at: now });
+    }
+    if lib.tombstones.len() > MAX_TOMBSTONES {
+        lib.tombstones.sort_by(|a, b| b.at.cmp(&a.at));
+        lib.tombstones.truncate(MAX_TOMBSTONES);
+    }
+    commit_library(&app, &old, &mut lib)?;
     let files = data_dir(&app)?.join("files");
     for p in removed {
         let file = PathBuf::from(&p.file);
@@ -408,6 +477,7 @@ fn delete_papers(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String> 
 fn update_paper(app: tauri::AppHandle, id: String, patch: PaperPatch) -> Result<Paper, String> {
     let _guard = LIBRARY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut lib = read_library(&app)?;
+    let old = lib.clone();
     let paper = lib.papers.iter_mut().find(|p| p.id == id).ok_or("找不到这篇文献")?;
     if let Some(tags) = patch.tags {
         let mut clean: Vec<String> = Vec::new();
@@ -428,7 +498,7 @@ fn update_paper(app: tauri::AppHandle, id: String, patch: PaperPatch) -> Result<
         paper.note = v;
     }
     let updated = paper.clone();
-    write_library(&app, &lib)?;
+    commit_library(&app, &old, &mut lib)?;
     Ok(updated)
 }
 
@@ -456,8 +526,9 @@ fn rename_tag(app: tauri::AppHandle, from: String, to: String) -> Result<Library
     }
     let _guard = LIBRARY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut lib = read_library(&app)?;
+    let old = lib.clone();
     retag(&mut lib, &from, &to);
-    write_library(&app, &lib)?;
+    commit_library(&app, &old, &mut lib)?;
     Ok(lib)
 }
 
@@ -466,8 +537,9 @@ fn rename_tag(app: tauri::AppHandle, from: String, to: String) -> Result<Library
 fn delete_tag(app: tauri::AppHandle, name: String) -> Result<Library, String> {
     let _guard = LIBRARY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut lib = read_library(&app)?;
+    let old = lib.clone();
     retag(&mut lib, &name, "");
-    write_library(&app, &lib)?;
+    commit_library(&app, &old, &mut lib)?;
     Ok(lib)
 }
 
@@ -641,6 +713,7 @@ fn import_inbox(app: tauri::AppHandle) -> Result<ImportResult, String> {
 
     let _guard = LIBRARY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut lib = read_library(&app)?;
+    let old = lib.clone();
     let files_dir = data_dir(&app)?.join("files");
     let failed_dir = inbox.join("failed");
 
@@ -718,7 +791,7 @@ fn import_inbox(app: tauri::AppHandle) -> Result<ImportResult, String> {
     }
 
     if !result.created.is_empty() || !result.updated.is_empty() {
-        write_library(&app, &lib)?;
+        commit_library(&app, &old, &mut lib)?;
         result.library = Some(lib);
     }
     Ok(result)
@@ -963,7 +1036,11 @@ pub fn run() {
             open_paper,
             get_settings,
             save_settings,
-            test_connection
+            test_connection,
+            sync::get_sync_settings,
+            sync::save_sync_settings,
+            sync::test_sync,
+            sync::sync_now
         ])
         .run(tauri::generate_context!())
         .expect("Summa 启动失败");

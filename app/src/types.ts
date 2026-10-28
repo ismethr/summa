@@ -48,3 +48,26 @@ export type Settings = {
 export type Library = {
   papers: Paper[];
 };
+
+export type SyncSettings = {
+  enabled: boolean;
+  auto: boolean;
+  url: string;
+  username: string;
+  has_password: boolean;
+  password_hint: string;
+  insecure: boolean;
+  last_sync: number;
+};
+
+export type SyncReport = {
+  at: number;
+  added: number;
+  updated: number;
+  deleted: number;
+  uploaded: boolean;
+  pdf_up: number;
+  pdf_down: number;
+  message: string;
+  library: Library | null;
+};
