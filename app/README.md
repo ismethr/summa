@@ -243,7 +243,21 @@ rm -rf ~/Applications/Summa.app && cp -R src-tauri/target/release/bundle/macos/S
 3. 在 [更新日志](../CHANGELOG.md) 记一条
 4. 改了数据结构的话，先备份 `library.json` 再装新版验证
 
-打包配置要点：`bundle.targets` 是 `["app"]`（跳过 dmg，避免 AppleScript 权限问题）；`bundle.icon` 要列全 png、`icon.icns`、`icon.ico`。图标从 1024×1024 源图生成：`npx tauri icon assets/icon-1024.png`。
+打包配置要点：`bundle.targets` 是 `["app"]`（跳过 dmg，避免 AppleScript 权限问题）；`bundle.icon` 要列全 png、`icon.icns`、`icon.ico`。
+
+**图标**：源图 `assets/icon-1024.png` 必须遵循 macOS 图标网格——**1024 画布，图形区 824×824 居中，四周留 100px 透明**，圆角用超椭圆（连续曲率）而不是普通圆角。铺满 1024 的方形图标在 Dock 里会比别的应用大一圈，四角也是直角，一眼就能看出来。改完源图执行：
+
+```bash
+npx tauri icon assets/icon-1024.png
+```
+
+设计稿如果是一整张带背景的方形图，先用 `assets/compose-icon.py` 处理（抠图 + 套底板 + 排版），它会输出符合网格的源图：
+
+```bash
+python3 assets/compose-icon.py 设计稿.png assets/icon-1024.png
+```
+
+该脚本依赖 numpy 与 Pillow，只在换图标时需要跑，产物已入库，日常构建不需要执行。
 
 **`bundle.macOS.signingIdentity` 必须是 `"-"`（ad-hoc 签名），不要删。** 这不是为了分发，而是功能必需：macOS 15 起，应用访问局域网（`192.168.x.x`）需要「本地网络」权限，而完全未签名的应用拿不到这个权限，连接会被系统静默切断。表现是同步一直失败、服务端日志里连请求都看不到。删掉这行，局域网 WebDAV 同步就会失效，而指向 `127.0.0.1` 或公网的测试完全正常，很难想到是这个原因。
 

@@ -36,5 +36,10 @@ Thumbs.db
 .workbuddy/
 .claude/
 
+# 图标设计过程文件：保留在本地以便继续编辑，不进仓库
+# 最终产物是 app/assets/icon-1024.png 与 app/src-tauri/icons/
+summa-app-icon.miora
+summa-app-icon_assets/
+
 # 临时文件
 *.log
