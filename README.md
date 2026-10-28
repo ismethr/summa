@@ -52,7 +52,23 @@ wenxian/
 └── CHANGELOG.md              更新日志
 ```
 
-## 快速开始
+## 下载安装
+
+到 [Releases](https://github.com/ismethr/summa/releases/latest) 下载 zip，解压后把 `Summa.app` 拖进「应用程序」。
+
+**首次打开要右键 → 打开 → 再点一次「打开」。** 包做了 ad-hoc 签名但没有 Apple 公证，直接双击会被 Gatekeeper 拦下。被拦了也可以在终端执行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Summa.app
+```
+
+目前提供 macOS Intel（x86_64）版本，Apple Silicon 的 Mac 通过 Rosetta 2 运行；Windows 尚未构建。
+
+打开后点左上角「设置」填入 DeepSeek API Key，然后就可以把 PDF 拖进窗口了。详细步骤见[使用手册](app/INSTALL.md)。
+
+Key 由你自备，程序不内置、不上传第三方，只保存在本机配置文件里。
+
+## 从源码构建
 
 需要 Node.js 20+ 与 Rust 1.77+；macOS 另需 Xcode Command Line Tools，Windows 需 MSVC 构建工具与 WebView2 运行时。
 
@@ -69,9 +85,7 @@ Windows 上打包需要显式指定安装包格式（配置里默认只出 macOS
 npm run tauri build -- --bundles nsis
 ```
 
-首次打开后点右上角「未配置 API Key」，填入自己的 DeepSeek Key（也可在设置里填），然后就可以把 PDF 拖进窗口了。详细步骤见[使用手册](app/INSTALL.md)。
-
-Key 由你自备，程序不内置、不上传第三方，只保存在本机配置文件里。
+打包配置里 `bundle.macOS.signingIdentity` 是 `"-"`（ad-hoc 签名），不要删。macOS 15 起，未签名的应用拿不到「本地网络」权限，连局域网 WebDAV 会被系统静默切断——表现是同步一直失败，而服务端日志里连请求都没有。
 
 ## 平台
 

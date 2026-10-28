@@ -22,7 +22,21 @@
 
 ## 1. 安装与打开
 
-目前没有发布预编译的安装包，需要从源码构建一次（只需做一次）：
+到 [Releases](https://github.com/ismethr/summa/releases/latest) 下载最新的 `Summa-版本号-macos-x86_64.zip`，解压后把 `Summa.app` 拖进「应用程序」文件夹（或任意目录）。
+
+目前提供 macOS Intel 版本。Apple Silicon 的 Mac 可以运行，首次启动时系统会提示安装 Rosetta 2，按提示装即可。
+
+**首次打开一定会被系统拦一次**，因为安装包虽然做了签名但没有经过 Apple 公证。处理方式：在图标上**右键 → 打开 → 再点一次「打开」**。之后双击就能正常打开了。
+
+如果右键打开也不行，在终端执行这一句解除隔离标记：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Summa.app
+```
+
+### 想自己从源码构建
+
+也可以，需要 Node.js 20+、Rust 1.77+ 和 Xcode Command Line Tools，首次编译约 10 分钟：
 
 ```bash
 git clone https://github.com/ismethr/summa.git
@@ -32,15 +46,13 @@ npm run tauri build
 cp -R src-tauri/target/release/bundle/macos/Summa.app ~/Applications/
 ```
 
-构建产物在 `app/src-tauri/target/release/bundle/macos/Summa.app`。
+### 打开方式
 
-装好之后，应用位置：
+应用位置（如果放在了「应用程序」里就是 `/Applications/Summa.app`）：
 
 ```
 ~/Applications/Summa.app
 ```
-
-打开方式，任选其一：
 
 - 打开「启动台」，搜索 **Summa**
 - 打开「访达」，按 `⌘ ⇧ G`，粘贴 `~/Applications`，双击 Summa
@@ -48,7 +60,7 @@ cp -R src-tauri/target/release/bundle/macos/Summa.app ~/Applications/
 
 想放进程序坞：打开后右键程序坞里的图标 → 选项 → 在程序坞中保留。
 
-首次打开如果提示「无法验证开发者」：右键点图标 → 打开 → 再点一次「打开」。之后不会再问。本机编译的应用一般不会触发这个提示。
+> 自己编译的版本同样带着 ad-hoc 签名。**别去掉这个签名**——macOS 15 起，未签名的应用拿不到「本地网络」权限，同步会连不上局域网 NAS，而且报错看起来像地址填错了。
 
 ## 2. 第一次使用：配置 API Key
 
@@ -312,7 +324,9 @@ Summa 本身免费，费用来自 DeepSeek 的 API 调用，直接从你的 Deep
 
 ### 更新
 
-从源码重新打包并替换（约 1–2 分钟）：
+**装的是发布包**：到 [Releases](https://github.com/ismethr/summa/releases/latest) 下载新版 zip，解压后替换掉旧的应用（先把旧的拖进废纸篓，或直接覆盖）。首次打开新版本可能又要右键 → 打开一次，因为签名变了。
+
+**装的是自己编译的**：拉取源码重新打包并替换（约 1–2 分钟）：
 
 ```bash
 cd summa/app
