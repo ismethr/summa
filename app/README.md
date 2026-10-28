@@ -245,6 +245,8 @@ rm -rf ~/Applications/Summa.app && cp -R src-tauri/target/release/bundle/macos/S
 
 打包配置要点：`bundle.targets` 是 `["app"]`（跳过 dmg，避免 AppleScript 权限问题）；`bundle.icon` 要列全 png、`icon.icns`、`icon.ico`。图标从 1024×1024 源图生成：`npx tauri icon assets/icon-1024.png`。
 
+**`bundle.macOS.signingIdentity` 必须是 `"-"`（ad-hoc 签名），不要删。** 这不是为了分发，而是功能必需：macOS 15 起，应用访问局域网（`192.168.x.x`）需要「本地网络」权限，而完全未签名的应用拿不到这个权限，连接会被系统静默切断。表现是同步一直失败、服务端日志里连请求都看不到。删掉这行，局域网 WebDAV 同步就会失效，而指向 `127.0.0.1` 或公网的测试完全正常，很难想到是这个原因。
+
 ## 约定与踩过的坑
 
 **窗口拖不动**：两个条件缺一不可，缺了都静默失败。
