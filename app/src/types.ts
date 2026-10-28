@@ -65,6 +65,7 @@ export type SyncReport = {
   added: number;
   updated: number;
   deleted: number;
+  conflicts: number;
   uploaded: boolean;
   pdf_up: number;
   pdf_down: number;

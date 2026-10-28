@@ -152,7 +152,7 @@ export default function App() {
       setSync(await invoke<SyncSettings>("get_sync_settings"));
       // 静默同步（启动时自动跑）只在真有变化时提示，
       // 否则每次开应用都弹一句"已是最新"，很快就会变成噪音
-      const changed = r.added || r.updated || r.deleted || r.pdf_up || r.pdf_down;
+      const changed = r.added || r.updated || r.deleted || r.conflicts || r.pdf_up || r.pdf_down;
       if (!silent || changed) setToast(r.message);
     } catch (e) {
       setToast(String(e));

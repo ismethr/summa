@@ -11,8 +11,6 @@ const MAX_PAGES: usize = 12;
 const DEFAULT_MODEL: &str = "deepseek-flash";
 const API_BASE: &str = "https://api.deepseek.com";
 const MAX_PDF_BYTES: u64 = 80 * 1024 * 1024;
-/// 墓碑上限。每条只有几十字节，留一千条足够覆盖多端来回同步的窗口期。
-const MAX_TOMBSTONES: usize = 1000;
 
 /// 文献库读写锁。连续拖入多篇时，几次 parse_pdf 会同时"读-改-写" library.json，
 /// 不加锁的话后写的会把先写的冲掉。
@@ -168,23 +166,10 @@ pub struct PaperPatch {
     note: Option<String>,
 }
 
-/// 删除标记。多端同步时，一台机器删掉的文献如果不留标记，
-/// 另一台机器下次同步会把它当成「只存在于远端」再传回来，也就是复活。
-#[derive(Serialize, Deserialize, Clone, Default)]
-pub struct Tombstone {
-    #[serde(default)]
-    pub id: String,
-    #[serde(default)]
-    pub at: u64,
-}
-
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub(crate) struct Library {
     #[serde(default)]
     pub(crate) papers: Vec<Paper>,
-    /// 已删除文献的墓碑，同步时取并集；超过上限会自动裁剪
-    #[serde(default)]
-    pub(crate) tombstones: Vec<Tombstone>,
 }
 
 // ---------- 工具 ----------
@@ -434,8 +419,6 @@ async fn parse_pdf(
     if let Some(i) = existing {
         lib.papers.remove(i);
     }
-    // 这篇之前可能被删过，重新拖进来就撤掉墓碑，否则下次同步又会被删掉
-    lib.tombstones.retain(|t| t.id != paper.id);
     lib.papers.insert(0, paper.clone());
     commit_library(&app, &old, &mut lib)?;
 
@@ -451,16 +434,8 @@ fn delete_papers(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String> 
     let (removed, kept): (Vec<Paper>, Vec<Paper>) =
         lib.papers.into_iter().partition(|p| ids.contains(&p.id));
     lib.papers = kept;
-    // 留墓碑：否则另一台机器下次同步会把这些文献当成"远端独有"再传回来
-    let now = now_stamp();
-    for p in &removed {
-        lib.tombstones.retain(|t| t.id != p.id);
-        lib.tombstones.push(Tombstone { id: p.id.clone(), at: now });
-    }
-    if lib.tombstones.len() > MAX_TOMBSTONES {
-        lib.tombstones.sort_by(|a, b| b.at.cmp(&a.at));
-        lib.tombstones.truncate(MAX_TOMBSTONES);
-    }
+    // 删除本身不需要留标记：同步时拿「上次同步的快照」比对，
+    // 快照里有、本地没有，就是删掉了（见 docs/03-sync-spec.md）
     commit_library(&app, &old, &mut lib)?;
     let files = data_dir(&app)?.join("files");
     for p in removed {

@@ -1,24 +1,29 @@
 //! WebDAV 同步。
 //!
-//! 设计取舍：
+//! 设计参考了 Obsidian 插件 remotely-save 的 v3 同步算法
+//! （<https://github.com/remotely-save/remotely-save>），核心有两条：
 //!
-//! 1. **不做整库覆盖。** 两台机器各加一篇，覆盖式同步会静默丢掉一篇，
-//!    而且用户看不出丢在哪。所以合并到记录级：按 id 取并集。
-//! 2. **同一篇以 `rev` 更大的一侧为准。** rev 在 `commit_library` 里统一刷新，
-//!    命令层不用各自记得改。
-//! 3. **删除用墓碑。** 只删记录不删远端的话，另一台机器下次同步会把它当成
-//!    「只存在于远端」再传回来。墓碑优先于存在，代价是「一边删、一边改」
-//!    时以删除为准（见 docs/03-sync-spec.md 的取舍说明）。
-//! 4. **`file` / `source` 是本机绝对路径**，上传前清空，下载后按 id 重建。
-//!    不清空的话，A 机器的 `/Users/a/...` 会漂到 B 机器上覆盖掉能用的路径。
-//! 5. **PDF 靠 `pdf-index.json` 判断存在性**，不逐篇 PROPFIND，
-//!    避免几百篇文献一次同步打几百个探测请求。
+//! 1. **三路比对**：拿「上次同步成功的快照」当第三个输入，
+//!    才能区分「本地删掉了」和「本地从来没有过」。
+//! 2. **同步状态只存本地**，不往远端写派生元数据。远端只有用户真正要的
+//!    东西（库和 PDF），出问题时可以手动查看和处理。
 //!
-//! 远端目录结构：
+//! 为什么不用「覆盖」或「墓碑」：
+//!
+//! - 整库覆盖：两台各加一篇，后同步的会把先同步的整库覆盖掉，**静默丢数据**。
+//! - 墓碑标记删除：墓碑优先于存在，于是「A 机删了、B 机恰好改了」时，
+//!   B 的修改会被无声丢弃。三路比对能看出 B 是「改过」而不是「没动过」，
+//!   这种冲突可以保留两份而不是丢掉一份。
+//!
+//! 冲突用「保留两份」而不是「较新者胜」：文献笔记是用户自己整理的东西，
+//! 自动丢弃一份等于替他做了决定。副本按 rev 决胜生成固定 id，
+//! 两端算出的结果一致，不会越同步越多。
+//!
+//! 远端布局：
 //!
 //! ```text
-//! <用户填的地址>/summa/library.json     文献库（含墓碑）
-//! <用户填的地址>/summa/pdf-index.json   有 PDF 的 id 列表
+//! <用户填的地址>/summa/library.json     文献库
+//! <用户填的地址>/summa/pdf-index.json   有 PDF 的 id 列表（纯缓存，丢了会自动重建）
 //! <用户填的地址>/summa/files/<id>.pdf   原文
 //! ```
 
@@ -33,6 +38,12 @@ const DAV_TIMEOUT: u64 = 300;
 /// 上传冲突（412）时的重试次数：另一台设备刚好在这几秒里写了远端
 const PUT_RETRY: usize = 2;
 const PROGRESS_EVENT: &str = "summa://sync";
+
+/// 删除保护：一次同步要删掉的数量超过阈值就中止。
+/// 远端文件被误删、库文件损坏、或者代码有 bug 时，这是最后一道闸。
+/// 正常情况下一次同步不会删掉十几篇文献。
+const DELETE_GUARD_ABS: usize = 12;
+const DELETE_GUARD_RATIO: f64 = 0.3;
 
 // ---------- 配置 ----------
 
@@ -75,10 +86,6 @@ fn dav_root(cfg: &DavConfig) -> String {
     format!("{}/summa", cfg.url.trim().trim_end_matches('/'))
 }
 
-fn has_password(p: &str) -> bool {
-    !p.is_empty()
-}
-
 fn mask_password(p: &str) -> String {
     let n = p.chars().count();
     if n == 0 {
@@ -94,9 +101,14 @@ fn mask_password(p: &str) -> String {
 
 // ---------- 同步状态 ----------
 //
-// 记下上次同步时远端的 ETag / Last-Modified，用来判断远端有没有变；
-// 记下上次上传内容的指纹，用来判断本地有没有变。
-// 两边都没变就完全跳过传输——自动同步每 5 分钟跑一次，不做这一步会很费流量。
+// 全部存在本机，不上传。四项各有用途：
+//
+// - `snapshot`：上次同步成功时每个 id 的 rev，三路比对的第三个输入。
+//   这是整个同步正确性的基础，丢了会退化成「并集 + 较新者胜」。
+// - `etag` / `last_modified`：判断远端有没有变，没变就不下载。
+// - `payload_hash`：判断本地有没有变，没变就不上传。
+//
+// 自动同步每次开应用都跑，不做这两项判断会白白传输几百 KB 到几 MB。
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct SyncState {
@@ -108,6 +120,10 @@ struct SyncState {
     last_sync: u64,
     #[serde(default)]
     payload_hash: u64,
+    /// id -> rev。老版本升级上来时为空，这时退化为并集合并，
+    /// 且必须强制拉一次远端，否则会把本地 rev 当成远端状态写进快照。
+    #[serde(default)]
+    snapshot: HashMap<String, u64>,
 }
 
 fn state_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -125,6 +141,11 @@ fn read_state(app: &tauri::AppHandle) -> SyncState {
 fn write_state(app: &tauri::AppHandle, s: &SyncState) -> Result<(), String> {
     let text = serde_json::to_string_pretty(s).map_err(|e| format!("序列化失败：{e}"))?;
     std::fs::write(state_path(app)?, text).map_err(|e| format!("保存同步状态失败：{e}"))
+}
+
+/// 由文献库算出快照。同步成功后调用。
+fn snapshot_of(lib: &Library) -> HashMap<String, u64> {
+    lib.papers.iter().map(|p| (p.id.clone(), sheet_rev(p))).collect()
 }
 
 /// FNV-1a。只用来判断「内容变没变」，不承担安全用途。
@@ -147,45 +168,280 @@ fn for_remote(lib: &Library) -> Vec<u8> {
     serde_json::to_vec_pretty(&copy).unwrap_or_default()
 }
 
-// ---------- 合并 ----------
+// ---------- 三路比对 ----------
+
+/// 一条记录相对「上次同步快照」的状态。
+///
+/// `Created` 和 `Unchanged` 必须分开：只看两边有没有这条记录，
+/// 判断不了「本地没有」是「删掉了」还是「从来没有过」，
+/// 前者要删远端，后者要拉下来。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Side {
+    /// 快照里也没有
+    Nowhere,
+    /// 快照里没有，现在有
+    Created,
+    /// 快照里有，现在也有，rev 未变
+    Unchanged,
+    /// 快照里有，现在也有，rev 变了
+    Modified,
+    /// 快照里有，现在没有了
+    Deleted,
+}
+
+fn side_state(now: Option<u64>, snap: Option<u64>) -> Side {
+    match (now, snap) {
+        (Some(_), None) => Side::Created,
+        (Some(n), Some(s)) if n == s => Side::Unchanged,
+        (Some(_), Some(_)) => Side::Modified,
+        (None, Some(_)) => Side::Deleted,
+        (None, None) => Side::Nowhere,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Act {
+    /// 本地优先，必要时上传
+    KeepLocal,
+    /// 采用远端
+    Pull,
+    /// 远端删了、本地没动 → 删本地
+    DeleteLocal,
+    /// 本地删了、远端没动 → 删远端
+    DeleteRemote,
+    /// 两边都改了 → 保留两份
+    Conflict,
+    /// 两边都没了
+    Drop,
+}
+
+/// 决策矩阵。行是本地状态，列是远端状态。
+///
+/// 两处非直觉的地方都是刻意的：
+/// - `Modified × Deleted` 取本地：本地改过说明用户还要它，
+///   远端那次删除很可能是在另一台机器上误删的。
+/// - `Deleted × Modified` 取远端：对称地，远端改过说明它还有价值。
+///
+/// 这两条替代了墓碑机制。旧方案里墓碑优先于存在，前一种情况会丢修改。
+fn decide(local: Side, remote: Side) -> Act {
+    use Act::*;
+    use Side::*;
+
+    // `Nowhere` = 两边都没有、快照里也没有。这时只看另一边：
+    // 另一边有就同步过去，两边都没有才丢弃。
+    // 这里不能一律丢弃——本地刚新增、远端还没有时正是 `Created × Nowhere`。
+    match (local, remote) {
+        (Nowhere, Nowhere) | (Nowhere, Deleted) | (Deleted, Nowhere) => return Drop,
+        (Nowhere, _) => return Pull,
+        (_, Nowhere) => return KeepLocal,
+        _ => {}
+    }
+
+    match (local, remote) {
+        (Unchanged, Unchanged) => KeepLocal,
+        (Unchanged, Modified) => Pull,
+        (Unchanged, Deleted) => DeleteLocal,
+        (Unchanged, Created) => Pull,
+
+        (Modified, Unchanged) => KeepLocal,
+        (Modified, Modified) => Conflict,
+        (Modified, Deleted) => KeepLocal,
+        (Modified, Created) => KeepLocal,
+
+        (Deleted, Unchanged) => DeleteRemote,
+        (Deleted, Modified) => Pull,
+        (Deleted, Deleted) => Drop,
+        (Deleted, Created) => Pull,
+
+        (Created, Unchanged) => KeepLocal,
+        (Created, Modified) => Conflict,
+        (Created, Deleted) => KeepLocal,
+        (Created, Created) => Conflict,
+
+        // 上面已经 return 完了，这里只为让 match 穷尽
+        (Nowhere, _) | (_, Nowhere) => Drop,
+    }
+}
 
 #[derive(Default, Debug)]
 struct MergeStats {
-    /// 只在远端存在，合并进来
+    /// 远端有、本地没有，拉下来
     added: usize,
-    /// 两边都有，远端更新，采用远端
+    /// 两端都有，采用远端版本
     updated: usize,
-    /// 命中墓碑，被移除
+    /// 本地被删除（远端删了）
     deleted: usize,
+    /// 远端被删除（本地删了）
+    remote_deleted: usize,
+    /// 两边都改了，保留两份
+    conflicts: usize,
 }
 
-/// 记录级合并。见文件头的四条规则。
-fn merge_libraries(local: &Library, remote: &Library) -> (Library, MergeStats) {
-    // 1. 墓碑取并集，同 id 取更晚的时间
-    let mut tombstones: Vec<Tombstone> = Vec::new();
-    for t in local.tombstones.iter().chain(remote.tombstones.iter()) {
-        if t.id.is_empty() {
-            continue;
-        }
-        match tombstones.iter_mut().find(|x| x.id == t.id) {
-            Some(x) => {
-                if t.at > x.at {
-                    x.at = t.at;
-                }
+/// 远端记录带的是另一台机器的绝对路径，不能拿来覆盖本地能用的路径。
+///
+/// A 机上传时 `for_remote` 会清空路径，但两边都改过时可能取到远端版本，
+/// 所以这里再兜一次：本地路径能打开就保留。
+fn adopt_local_paths(p: &mut Paper, local: Option<(&str, &str)>) {
+    match local {
+        Some((lf, ls)) => {
+            if !lf.is_empty() && Path::new(lf).is_file() {
+                p.file = lf.to_string();
+            } else if !p.file.is_empty() && !Path::new(&p.file).is_file() {
+                p.file.clear();
             }
-            None => tombstones.push(t.clone()),
+            if !ls.is_empty() && Path::new(ls).is_file() {
+                p.source = ls.to_string();
+            } else if !p.source.is_empty() && !Path::new(&p.source).is_file() {
+                p.source.clear();
+            }
+        }
+        None => {
+            p.file.clear();
+            p.source.clear();
         }
     }
-    let dead: HashSet<String> = tombstones.iter().map(|t| t.id.clone()).collect();
+}
 
-    // 2. 本地路径快照。远端记录的路径属于另一台机器，不能拿来覆盖
+/// 冲突时按 rev 决胜，rev 相同则比内容。
+///
+/// 必须两端算出同一个结果——否则 A 保留本地、B 也保留本地，
+/// 同步几次之后两边各有一份「原件」，副本越滚越多。
+fn pick_winner<'a>(a: &'a Paper, b: &'a Paper) -> (&'a Paper, &'a Paper) {
+    let (ra, rb) = (sheet_rev(a), sheet_rev(b));
+    if ra != rb {
+        return if ra > rb { (a, b) } else { (b, a) };
+    }
+    let sa = serde_json::to_string(a).unwrap_or_default();
+    let sb = serde_json::to_string(b).unwrap_or_default();
+    if sa >= sb {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// 冲突副本：id 由败者的 rev 决定，两端算出的 id 相同，
+/// 于是下次同步会把它识别成「同一篇」，不会再多生成一份。
+fn conflict_copy(winner: &Paper, loser: &Paper) -> Paper {
+    let mut c = loser.clone();
+    let at = sheet_rev(winner);
+    c.id = format!("{}c{}", loser.id, sheet_rev(loser));
+    c.title = format!("{}（冲突副本）", loser.title);
+    // rev 和 added 都取胜者的修改时间：
+    // - rev 让它和原件的「新旧」一致，不会被判成更旧的版本
+    // - added 让它在「最近添加」排序里靠前，用户能看见
+    // 注意 id 里的数字用的是败者 rev，那是身份标识，与 rev 无关
+    c.rev = at;
+    c.added = at;
+    c
+}
+
+/// 相对上次同步，有多少篇会消失。
+///
+/// 用快照当基线而不是「本地删的 + 远端删的」，是为了覆盖
+/// 「远端没变、本地被清空」这种情况——那时根本没有做过合并。
+fn count_removals(snapshot: &HashMap<String, u64>, merged: &Library) -> usize {
+    if snapshot.is_empty() {
+        return 0; // 没有快照就判断不了删除，也就无所谓保护
+    }
+    let live: HashSet<&str> = merged.papers.iter().map(|p| p.id.as_str()).collect();
+    snapshot.keys().filter(|id| !live.contains(id.as_str())).count()
+}
+
+/// 三路合并。`snapshot` 是上次同步成功时的 id -> rev。
+fn merge_three_way(local: &Library, remote: &Library, snapshot: &HashMap<String, u64>) -> (Library, MergeStats) {
+    let local_path: HashMap<&str, (&str, &str)> = local
+        .papers
+        .iter()
+        .map(|p| (p.id.as_str(), (p.file.as_str(), p.source.as_str())))
+        .collect();
+    let lmap: HashMap<&str, &Paper> = local.papers.iter().map(|p| (p.id.as_str(), p)).collect();
+    let rmap: HashMap<&str, &Paper> = remote.papers.iter().map(|p| (p.id.as_str(), p)).collect();
+
+    let mut order: Vec<String> = Vec::new();
+    let mut known: HashSet<String> = HashSet::new();
+    for p in local.papers.iter().chain(remote.papers.iter()) {
+        if !p.id.is_empty() && known.insert(p.id.clone()) {
+            order.push(p.id.clone());
+        }
+    }
+
+    let mut stats = MergeStats::default();
+    let mut papers: Vec<Paper> = Vec::new();
+    let mut copies: Vec<Paper> = Vec::new();
+
+    for id in order {
+        let l = lmap.get(id.as_str()).copied();
+        let r = rmap.get(id.as_str()).copied();
+        let snap = snapshot.get(&id).copied();
+        let act = decide(side_state(l.map(sheet_rev), snap), side_state(r.map(sheet_rev), snap));
+        let paths = local_path.get(id.as_str()).copied();
+
+        match act {
+            Act::Drop => {}
+            Act::KeepLocal => {
+                if let Some(p) = l {
+                    let mut p = p.clone();
+                    adopt_local_paths(&mut p, paths);
+                    papers.push(p);
+                }
+            }
+            Act::Pull => {
+                if let Some(p) = r {
+                    let mut p = p.clone();
+                    adopt_local_paths(&mut p, paths);
+                    papers.push(p);
+                    if l.is_some() {
+                        stats.updated += 1;
+                    } else {
+                        stats.added += 1;
+                    }
+                }
+            }
+            Act::DeleteLocal => stats.deleted += 1,
+            Act::DeleteRemote => stats.remote_deleted += 1,
+            Act::Conflict => {
+                if let (Some(lp), Some(rp)) = (l, r) {
+                    let (win, lose) = pick_winner(lp, rp);
+                    let mut w = win.clone();
+                    adopt_local_paths(&mut w, paths);
+                    papers.push(w);
+                    let copy = conflict_copy(win, lose);
+                    // 上一次同步可能已经为同一个冲突生成过这个 id
+                    if !known.contains(&copy.id) {
+                        copies.push(copy);
+                    }
+                    stats.conflicts += 1;
+                } else if let Some(p) = l.or(r) {
+                    // 理论上到不了这里；保守起见保留，不丢数据
+                    let mut p = p.clone();
+                    adopt_local_paths(&mut p, paths);
+                    papers.push(p);
+                }
+            }
+        }
+    }
+
+    // 副本放最前，用户一眼能看到
+    for c in copies.into_iter().rev() {
+        papers.insert(0, c);
+    }
+    papers.sort_by(|a, b| b.added.cmp(&a.added));
+
+    (Library { papers }, stats)
+}
+
+/// 没有快照时的退化方案：并集 + 较新者胜。
+///
+/// 用于两种情况：第一次同步，以及用户删了 `sync-state.json`。
+/// 这时判断不了删除，所以保守地既不删本地也不删远端，只做合并。
+fn merge_bootstrap(local: &Library, remote: &Library) -> (Library, MergeStats) {
     let local_path: HashMap<&str, (&str, &str)> = local
         .papers
         .iter()
         .map(|p| (p.id.as_str(), (p.file.as_str(), p.source.as_str())))
         .collect();
 
-    // 3. 取并集
     let mut stats = MergeStats::default();
     let mut order: Vec<String> = Vec::new();
     let mut by_id: HashMap<String, Paper> = HashMap::new();
@@ -215,43 +471,14 @@ fn merge_libraries(local: &Library, remote: &Library) -> (Library, MergeStats) {
         }
     }
 
-    // 4. 去墓碑 + 修路径
     let mut papers = Vec::with_capacity(order.len());
     for id in order {
-        if dead.contains(&id) {
-            stats.deleted += 1;
-            continue;
-        }
         let Some(mut p) = by_id.remove(&id) else { continue };
-        match local_path.get(id.as_str()) {
-            Some((lf, ls)) => {
-                // 本地路径能打开就保留；远端带来的路径在本机通常不存在，清掉
-                if !lf.is_empty() && Path::new(lf).is_file() {
-                    p.file = (*lf).to_string();
-                } else if !p.file.is_empty() && !Path::new(&p.file).is_file() {
-                    p.file.clear();
-                }
-                if !ls.is_empty() && Path::new(ls).is_file() {
-                    p.source = (*ls).to_string();
-                } else if !p.source.is_empty() && !Path::new(&p.source).is_file() {
-                    p.source.clear();
-                }
-            }
-            None => {
-                // 只来自远端的记录，路径一定不属于本机
-                p.file.clear();
-                p.source.clear();
-            }
-        }
+        adopt_local_paths(&mut p, local_path.get(id.as_str()).copied());
         papers.push(p);
     }
     papers.sort_by(|a, b| b.added.cmp(&a.added));
-
-    if tombstones.len() > MAX_TOMBSTONES {
-        tombstones.sort_by(|a, b| b.at.cmp(&a.at));
-        tombstones.truncate(MAX_TOMBSTONES);
-    }
-    (Library { papers, tombstones }, stats)
+    (Library { papers }, stats)
 }
 
 // ---------- HTTP ----------
@@ -431,7 +658,7 @@ pub fn get_sync_settings(app: tauri::AppHandle) -> SyncSettings {
         auto: cfg.auto,
         url: cfg.url,
         username: cfg.username,
-        has_password: has_password(&cfg.password),
+        has_password: !cfg.password.is_empty(),
         password_hint: mask_password(&cfg.password),
         insecure: cfg.insecure,
         last_sync: read_state(&app).last_sync,
@@ -487,13 +714,8 @@ pub async fn test_sync(app: tauri::AppHandle) -> Result<String, String> {
             let lib: Library = serde_json::from_slice(&raw)
                 .map_err(|e| format!("目录可写，但远端 library.json 解析失败：{e}"))?;
             Ok(format!(
-                "连接成功。远端已有 {} 篇文献{}，可以直接同步。",
-                lib.papers.len(),
-                if lib.tombstones.is_empty() {
-                    String::new()
-                } else {
-                    format!("（含 {} 条删除记录）", lib.tombstones.len())
-                }
+                "连接成功。远端已有 {} 篇文献，可以直接同步。",
+                lib.papers.len()
             ))
         }
         None => Ok("连接成功，目录可写。远端还没有文献库，第一次同步会建立。".into()),
@@ -506,6 +728,7 @@ pub struct SyncReport {
     added: usize,
     updated: usize,
     deleted: usize,
+    conflicts: usize,
     uploaded: bool,
     pdf_up: usize,
     pdf_down: usize,
@@ -521,7 +744,7 @@ fn lock_library() -> std::sync::MutexGuard<'static, ()> {
     LIBRARY_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 完整的同步流程：拉远端库 → 合并 → 上传 → 同步 PDF → 记录状态。
+/// 完整的同步流程：拉远端库 → 三路合并 → 上传 → 同步 PDF → 记录快照。
 #[tauri::command]
 pub async fn sync_now(app: tauri::AppHandle) -> Result<SyncReport, String> {
     let cfg = dav_config(&app);
@@ -556,21 +779,46 @@ pub async fn sync_now(app: tauri::AppHandle) -> Result<SyncReport, String> {
     if let Some((etag, lm)) = dav_head(&client, &cfg, &lib_url).await? {
         remote_missing = false;
         remote_etag = etag.clone();
-        let unchanged =
-            (!etag.is_empty() && etag == state.etag) || (etag.is_empty() && !lm.is_empty() && lm == state.last_modified);
+        // 快照为空时必须真拉一次：否则会把本地 rev 当成远端状态写进快照，
+        // 下次同步就会误判「远端改过」
+        let unchanged = !state.snapshot.is_empty()
+            && ((!etag.is_empty() && etag == state.etag)
+                || (etag.is_empty() && !lm.is_empty() && lm == state.last_modified));
         if !unchanged {
             if let Some(raw) = dav_get(&client, &cfg, &lib_url).await? {
                 let remote: Library = serde_json::from_slice(&raw).map_err(|e| {
                     format!("服务器上的 library.json 无法解析（{e}）。已中止同步，本地数据没有改动。")
                 })?;
-                let (m, stats) = merge_libraries(&local, &remote);
+                let (m, stats) = if state.snapshot.is_empty() {
+                    merge_bootstrap(&local, &remote)
+                } else {
+                    merge_three_way(&local, &remote, &state.snapshot)
+                };
                 merged = m;
                 merged_dirty = true;
                 report.added = stats.added;
                 report.updated = stats.updated;
                 report.deleted = stats.deleted;
+                report.conflicts = stats.conflicts;
             }
         }
+    }
+
+    // 删除保护：与上次同步的快照比，有多少篇会消失。
+    //
+    // 必须在「是否拉取远端」之外单独算：远端没变时会跳过合并，
+    // 此时若本地 library.json 损坏或被清空，会直接把空库推上去，
+    // 远端跟着被抹掉——这正是这条闸要拦的情况。
+    let removing = count_removals(&state.snapshot, &merged);
+    let baseline = state.snapshot.len().max(merged.papers.len());
+    if removing > DELETE_GUARD_ABS && (removing as f64) > (baseline as f64) * DELETE_GUARD_RATIO {
+        return Err(format!(
+            "本次同步会删除 {removing} 篇（上次同步有 {} 篇），超过安全阈值，已中止，远端和本地都没有改动。\n\n\
+             常见原因：本地 library.json 被清空或替换、另一台设备重置了文献库、远端文件被误改。\n\n\
+             如果本地文献确实丢了，想从服务器恢复：完全退出应用，删除数据目录里的 sync-state.json，\
+             再打开同步一次，会用远端的内容重建本地库。",
+            baseline
+        ));
     }
 
     // 合并结果与本地不同才落盘；这里不走 commit_library，
@@ -600,10 +848,15 @@ pub async fn sync_now(app: tauri::AppHandle) -> Result<SyncReport, String> {
             }
             if let Some(raw) = dav_get(&client, &cfg, &lib_url).await? {
                 if let Ok(remote) = serde_json::from_slice::<Library>(&raw) {
-                    let (m, stats) = merge_libraries(&merged, &remote);
+                    let (m, stats) = if state.snapshot.is_empty() {
+                        merge_bootstrap(&merged, &remote)
+                    } else {
+                        merge_three_way(&merged, &remote, &state.snapshot)
+                    };
                     merged = m;
-                    report.updated += stats.updated;
                     report.added += stats.added;
+                    report.updated += stats.updated;
+                    report.conflicts += stats.conflicts;
                 }
             }
             if let Some((etag, _)) = dav_head(&client, &cfg, &lib_url).await? {
@@ -649,7 +902,7 @@ pub async fn sync_now(app: tauri::AppHandle) -> Result<SyncReport, String> {
         report.pdf_up += 1;
     }
 
-    // 远端有、本机没有 → 下载（墓碑或已删除的 id 不下）
+    // 远端有、本机没有 → 下载
     let live: HashSet<String> = merged.papers.iter().map(|p| p.id.clone()).collect();
     let missing: Vec<String> = remote_ids
         .iter()
@@ -679,7 +932,7 @@ pub async fn sync_now(app: tauri::AppHandle) -> Result<SyncReport, String> {
         write_library(&app, &merged)?;
     }
 
-    // 索引收窄到仍在库里的 id，顺便清理远端没有对应文献的条目
+    // 索引收窄到仍在库里的 id
     remote_ids.retain(|id| live.contains(id));
     if remote_ids.len() != before_ids || report.pdf_up > 0 {
         let mut ids: Vec<String> = remote_ids.into_iter().collect();
@@ -690,11 +943,11 @@ pub async fn sync_now(app: tauri::AppHandle) -> Result<SyncReport, String> {
 
     // ---- 4. 记录状态 ----
     let (final_etag, final_lm) = dav_head(&client, &cfg, &lib_url).await?.unwrap_or_default();
-    let final_payload = for_remote(&merged);
     state.etag = final_etag;
     state.last_modified = final_lm;
     state.last_sync = now_stamp();
-    state.payload_hash = fnv64(&final_payload);
+    state.payload_hash = fnv64(&for_remote(&merged));
+    state.snapshot = snapshot_of(&merged);
     write_state(&app, &state)?;
 
     report.message = summarize(&report);
@@ -712,7 +965,10 @@ fn summarize(r: &SyncReport) -> String {
         parts.push(format!("更新 {} 篇", r.updated));
     }
     if r.deleted > 0 {
-        parts.push(format!("按另一台设备的删除移除 {} 篇", r.deleted));
+        parts.push(format!("远端已删除，同步移除 {} 篇", r.deleted));
+    }
+    if r.conflicts > 0 {
+        parts.push(format!("{} 处冲突已各保留两份", r.conflicts));
     }
     if r.pdf_up > 0 {
         parts.push(format!("上传原文 {} 篇", r.pdf_up));
@@ -733,80 +989,176 @@ fn summarize(r: &SyncReport) -> String {
 mod tests {
     use super::*;
 
-    fn paper(id: &str, rev: u64, gist: &str) -> Paper {
-        Paper { id: id.into(), title: format!("T{id}"), gist: gist.into(), rev, added: rev, ..Default::default() }
+    fn paper(id: &str, rev: u64) -> Paper {
+        Paper {
+            id: id.into(),
+            title: format!("T{id}"),
+            gist: format!("rev{rev}"),
+            rev,
+            added: rev,
+            ..Default::default()
+        }
+    }
+
+    fn lib(papers: Vec<Paper>) -> Library {
+        Library { papers }
+    }
+
+    fn snap(items: &[(&str, u64)]) -> HashMap<String, u64> {
+        items.iter().map(|(id, rev)| (id.to_string(), *rev)).collect()
+    }
+
+    fn ids(l: &Library) -> Vec<String> {
+        let mut v: Vec<String> = l.papers.iter().map(|p| p.id.clone()).collect();
+        v.sort();
+        v
     }
 
     #[test]
-    fn 两边各加一篇合并后都在() {
-        let local = Library { papers: vec![paper("a", 100, "本地")], tombstones: vec![] };
-        let remote = Library { papers: vec![paper("b", 200, "远端")], tombstones: vec![] };
-        let (m, stats) = merge_libraries(&local, &remote);
-        assert_eq!(m.papers.len(), 2);
-        assert_eq!(stats.added, 1);
-        assert!(m.papers.iter().any(|p| p.id == "a"));
-        assert!(m.papers.iter().any(|p| p.id == "b"));
-    }
-
-    #[test]
-    fn 同一篇以rev大的一侧为准() {
-        let local = Library { papers: vec![paper("a", 100, "旧")], tombstones: vec![] };
-        let remote = Library { papers: vec![paper("a", 300, "新")], tombstones: vec![] };
-        let (m, _) = merge_libraries(&local, &remote);
+    fn 无变化时不产生动作() {
+        let (m, st) = merge_three_way(&lib(vec![paper("a", 100)]), &lib(vec![paper("a", 100)]), &snap(&[("a", 100)]));
         assert_eq!(m.papers.len(), 1);
-        assert_eq!(m.papers[0].gist, "新");
-
-        // 反过来本地更新，不该被远端旧数据覆盖
-        let (m2, _) = merge_libraries(&remote, &local);
-        assert_eq!(m2.papers[0].gist, "新");
+        assert_eq!((st.added, st.updated, st.deleted, st.remote_deleted, st.conflicts), (0, 0, 0, 0, 0));
     }
 
     #[test]
-    fn 墓碑优先于存在() {
-        let local = Library { papers: vec![], tombstones: vec![Tombstone { id: "a".into(), at: 500 }] };
-        let remote = Library { papers: vec![paper("a", 100, "远端还在")], tombstones: vec![] };
-        let (m, stats) = merge_libraries(&local, &remote);
-        assert!(m.papers.is_empty(), "被删过的文献不应该被另一台机器带回来");
-        assert_eq!(stats.deleted, 1);
-        assert_eq!(m.tombstones.len(), 1, "墓碑要保留，否则下次又被复活");
+    fn 两边各新增一篇都保留() {
+        let l = lib(vec![paper("a", 100), paper("b", 200)]);
+        let r = lib(vec![paper("a", 100), paper("c", 300)]);
+        let (m, st) = merge_three_way(&l, &r, &snap(&[("a", 100)]));
+        assert_eq!(ids(&m), vec!["a", "b", "c"]);
+        assert_eq!(st.added, 1);
+        assert_eq!(st.conflicts, 0);
     }
 
     #[test]
-    fn 墓碑并集同id取更晚时间() {
-        let local = Library { papers: vec![], tombstones: vec![Tombstone { id: "a".into(), at: 100 }] };
-        let remote = Library { papers: vec![], tombstones: vec![Tombstone { id: "a".into(), at: 900 }, Tombstone { id: "b".into(), at: 50 }] };
-        let (m, _) = merge_libraries(&local, &remote);
-        assert_eq!(m.tombstones.len(), 2);
-        assert_eq!(m.tombstones.iter().find(|t| t.id == "a").unwrap().at, 900);
+    fn 单边修改直接采用() {
+        let (m, st) = merge_three_way(&lib(vec![paper("a", 100)]), &lib(vec![paper("a", 900)]), &snap(&[("a", 100)]));
+        assert_eq!(m.papers[0].gist, "rev900");
+        assert_eq!(st.updated, 1);
+        assert_eq!(st.conflicts, 0);
+    }
+
+    #[test]
+    fn 双边修改保留两份且两端结果一致() {
+        let l = lib(vec![paper("a", 500)]);
+        let r = lib(vec![paper("a", 900)]);
+        let s = snap(&[("a", 100)]);
+
+        let (m1, st1) = merge_three_way(&l, &r, &s);
+        assert_eq!(st1.conflicts, 1);
+        assert_eq!(m1.papers.len(), 2, "冲突应产生一份副本");
+        assert_eq!(ids(&m1), vec!["a", "ac500"]);
+
+        // 反过来算一次（模拟另一台设备），必须得到同一组 id
+        let (m2, _) = merge_three_way(&r, &l, &s);
+        assert_eq!(ids(&m1), ids(&m2), "两端必须算出同样的结果，否则副本会越滚越多");
+        assert_eq!(m1.papers.iter().find(|p| p.id == "a").unwrap().gist, "rev900", "新的一版保住原 id");
+    }
+
+    /// 另一台设备已经生成过副本时，本机不再生成第二份
+    #[test]
+    fn 已存在的冲突副本不会重复生成() {
+        // B 机：本地是旧版 a(500)，快照里只有 a(100)
+        let l = lib(vec![paper("a", 500)]);
+        // A 机同步后远端已有胜者 a(900) 和 A 生成的副本 ac500
+        let r = lib(vec![paper("a", 900), paper("ac500", 500)]);
+        let (m, st) = merge_three_way(&l, &r, &snap(&[("a", 100)]));
+        assert_eq!(st.conflicts, 1, "仍应报告冲突");
+        assert_eq!(ids(&m), vec!["a", "ac500"], "不应再多出一份副本");
+        assert_eq!(m.papers.iter().find(|p| p.id == "a").unwrap().gist, "rev900");
+    }
+
+    #[test]
+    fn 远端删除会移除本地未改动的() {
+        let l = lib(vec![paper("a", 100), paper("b", 100)]);
+        let r = lib(vec![paper("a", 100)]);
+        let (m, st) = merge_three_way(&l, &r, &snap(&[("a", 100), ("b", 100)]));
+        assert_eq!(ids(&m), vec!["a"]);
+        assert_eq!(st.deleted, 1);
+    }
+
+    #[test]
+    fn 本地删除会移除远端未改动的() {
+        let l = lib(vec![paper("a", 100)]);
+        let r = lib(vec![paper("a", 100), paper("b", 100)]);
+        let (m, st) = merge_three_way(&l, &r, &snap(&[("a", 100), ("b", 100)]));
+        assert_eq!(ids(&m), vec!["a"]);
+        assert_eq!(st.remote_deleted, 1);
+    }
+
+    /// 旧的墓碑方案会在这里丢数据：一边删、一边改
+    #[test]
+    fn 远端删除但本地改过则保留修改() {
+        let (m, st) = merge_three_way(&lib(vec![paper("a", 800)]), &lib(vec![]), &snap(&[("a", 100)]));
+        assert_eq!(m.papers.len(), 1, "本地改过的不能被远端删除带走");
+        assert_eq!(m.papers[0].gist, "rev800");
+        assert_eq!(st.deleted, 0);
+    }
+
+    #[test]
+    fn 本地删除但远端改过则取远端() {
+        let (m, st) = merge_three_way(&lib(vec![]), &lib(vec![paper("a", 800)]), &snap(&[("a", 100)]));
+        assert_eq!(m.papers.len(), 1);
+        assert_eq!(m.papers[0].gist, "rev800");
+        assert_eq!(st.remote_deleted, 0);
+    }
+
+    #[test]
+    fn 两边都删除时静默丢弃() {
+        let (m, st) = merge_three_way(&lib(vec![]), &lib(vec![]), &snap(&[("a", 100)]));
+        assert!(m.papers.is_empty());
+        assert_eq!((st.deleted, st.remote_deleted, st.conflicts), (0, 0, 0));
+    }
+
+    /// 没有快照时退化为并集，绝不删东西
+    #[test]
+    fn 空快照退化为并集不删除() {
+        let l = lib(vec![paper("a", 100), paper("b", 200)]);
+        let r = lib(vec![paper("a", 300)]);
+        let (m, st) = merge_bootstrap(&l, &r);
+        assert_eq!(m.papers.len(), 2, "不能因为快照为空就删本地");
+        assert_eq!(st.deleted, 0);
+        assert_eq!(m.papers.iter().find(|p| p.id == "a").unwrap().gist, "rev300");
+    }
+
+    /// 删除保护按快照算「会消失几篇」，新增不计入
+    #[test]
+    fn 删除保护统计会消失的篇数() {
+        let s = snap(&[("a", 1), ("b", 2), ("c", 3)]);
+        assert_eq!(count_removals(&s, &lib(vec![paper("a", 1), paper("c", 3)])), 1);
+        assert_eq!(count_removals(&s, &lib(vec![])), 3, "本地被清空时应数出全部");
+        assert_eq!(
+            count_removals(&s, &lib(vec![paper("a", 1), paper("b", 2), paper("c", 3), paper("d", 4)])),
+            0,
+            "新增不能算作删除"
+        );
+        assert_eq!(
+            count_removals(&HashMap::new(), &lib(vec![])),
+            0,
+            "没有快照时不能触发保护，否则首次同步必然被拦"
+        );
+    }
+
+    #[test]
+    fn 上传前清空本机路径且不改动原库() {        let mut p = paper("a", 100);
+        p.file = "/Users/me/files/a.pdf".into();
+        let l = lib(vec![p]);
+        let bytes = for_remote(&l);
+        let sent: Library = serde_json::from_slice(&bytes).unwrap();
+        assert!(sent.papers[0].file.is_empty());
+        assert_eq!(l.papers[0].file, "/Users/me/files/a.pdf", "原库不能被改");
     }
 
     #[test]
     fn 远端带来的本机路径会被清掉() {
-        let mut l = paper("a", 100, "本地");
-        l.file = "/tmp/summa-test-nonexistent.pdf".into();
-        l.source = "/tmp/summa-test-nonexistent.pdf".into();
-        let local = Library { papers: vec![l], tombstones: vec![] };
-
-        let mut r = paper("b", 200, "远端");
-        r.file = "/Users/someone-else/Library/files/b.pdf".into();
+        let mut r = paper("b", 200);
+        r.file = "/Users/someone-else/files/b.pdf".into();
         r.source = "/Users/someone-else/Downloads/b.pdf".into();
-        let remote = Library { papers: vec![r], tombstones: vec![] };
-
-        let (m, _) = merge_libraries(&local, &remote);
+        let (m, _) = merge_bootstrap(&lib(vec![]), &lib(vec![r]));
         let b = m.papers.iter().find(|p| p.id == "b").unwrap();
         assert!(b.file.is_empty(), "另一台机器的绝对路径不能留");
         assert!(b.source.is_empty());
-    }
-
-    #[test]
-    fn 上传前清空本机路径且不改动原库() {
-        let mut p = paper("a", 100, "x");
-        p.file = "/Users/me/files/a.pdf".into();
-        let lib = Library { papers: vec![p], tombstones: vec![] };
-        let bytes = for_remote(&lib);
-        let sent: Library = serde_json::from_slice(&bytes).unwrap();
-        assert!(sent.papers[0].file.is_empty());
-        assert_eq!(lib.papers[0].file, "/Users/me/files/a.pdf", "原库不能被改");
     }
 
     #[test]
@@ -856,7 +1208,7 @@ mod tests {
             dav_mkcol(&client, &cfg, &format!("{root}/files")).await?;
 
             let file = format!("{root}/library.json");
-            let body = br#"{"papers":[],"tombstones":[]}"#.to_vec();
+            let body = br#"{"papers":[]}"#.to_vec();
             assert!(dav_put(&client, &cfg, &file, body.clone(), None).await?, "首次上传应成功");
 
             let (etag, _lm) = dav_head(&client, &cfg, &file).await?.expect("远端应存在");
