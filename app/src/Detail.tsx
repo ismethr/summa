@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
-import type { Paper } from "./types";
+import type { Folder, Paper } from "./types";
+import FolderPicker from "./FolderPicker";
+import { folderRows } from "./folders";
 
 export type PaperChanges = Partial<Pick<Paper, "tags" | "read" | "starred" | "note">>;
 
@@ -7,6 +9,8 @@ type Props = {
   paper: Paper;
   allTopics: string[];
   canFile: boolean;
+  folders: Folder[];
+  onMove: (id: string) => void;
   onPatch: (changes: PaperChanges) => void;
   onOpen: () => void;
   onDelete: () => void;
@@ -24,7 +28,7 @@ export function citation(p: Paper) {
   return parts.join("");
 }
 
-export default function Detail({ paper, allTopics, canFile, onPatch, onOpen, onDelete }: Props) {
+export default function Detail({ paper, allTopics, canFile, folders, onMove, onPatch, onOpen, onDelete }: Props) {
   const [note, setNote] = useState(paper.note ?? "");
   const [adding, setAdding] = useState(false);
   const [newTag, setNewTag] = useState("");
@@ -101,6 +105,7 @@ export default function Detail({ paper, allTopics, canFile, onPatch, onOpen, onD
         )}
       </div>
 
+      <FolderPicker folders={folders} value={folderRows(folders).some((r) => r.folder.id === paper.folder_id) ? paper.folder_id! : ""} onChange={onMove} />
       <div className="d-tags">
         {paper.tags.map((t) => (
           <span className="chip tag-edit" key={t}>

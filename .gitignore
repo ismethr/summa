@@ -4,6 +4,8 @@ node_modules/
 # 前端构建产物
 dist/
 dist-ssr/
+.test-dist/
+/artifacts/
 *.local
 
 # Rust 构建产物

@@ -1,12 +1,13 @@
 {
   "name": "summa",
   "private": true,
-  "version": "0.6.1",
+  "version": "0.7.0",
   "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test": "tsc -p tsconfig.test.json && node --test tests/*.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "start": "tauri dev"

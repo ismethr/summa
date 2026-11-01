@@ -428,7 +428,7 @@ fn merge_three_way(local: &Library, remote: &Library, snapshot: &HashMap<String,
     }
     papers.sort_by(|a, b| b.added.cmp(&a.added));
 
-    (Library { papers }, stats)
+    (Library { papers, folders: folders::merge(&local.folders, &remote.folders) }, stats)
 }
 
 /// 没有快照时的退化方案：并集 + 较新者胜。
@@ -478,7 +478,7 @@ fn merge_bootstrap(local: &Library, remote: &Library) -> (Library, MergeStats) {
         papers.push(p);
     }
     papers.sort_by(|a, b| b.added.cmp(&a.added));
-    (Library { papers }, stats)
+    (Library { papers, folders: folders::merge(&local.folders, &remote.folders) }, stats)
 }
 
 // ---------- HTTP ----------
@@ -1001,7 +1001,7 @@ mod tests {
     }
 
     fn lib(papers: Vec<Paper>) -> Library {
-        Library { papers }
+        Library { papers, ..Default::default() }
     }
 
     fn snap(items: &[(&str, u64)]) -> HashMap<String, u64> {
@@ -1012,6 +1012,24 @@ mod tests {
         let mut v: Vec<String> = l.papers.iter().map(|p| p.id.clone()).collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn 文件夹在首次和三路同步中均保留且删除不复活() {
+        let folder = folders::Folder { id: "f1".into(), name: "课题".into(), rev: 10, ..Default::default() };
+        let mut local = lib(vec![Paper { folder_id: "f1".into(), ..paper("a", 100) }]);
+        local.folders.push(folder.clone());
+        let remote = lib(vec![paper("a", 100)]);
+        let (bootstrap, _) = merge_bootstrap(&local, &remote);
+        assert_eq!(bootstrap.folders, vec![folder.clone()]);
+        let mut deleted = local.clone();
+        deleted.folders[0].deleted = true;
+        deleted.folders[0].rev = 20;
+        let (merged, _) = merge_three_way(&local, &deleted, &snap(&[("a", 100)]));
+        assert!(merged.folders[0].deleted);
+        let uploaded: Library = serde_json::from_slice(&for_remote(&bootstrap)).unwrap();
+        assert_eq!(uploaded.folders, vec![folder]);
+        assert_eq!(uploaded.papers[0].folder_id, "f1");
     }
 
     #[test]

@@ -1330,3 +1330,36 @@ p.sec-p {
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
   cursor: pointer;
 }
+
+/* ---------- 自定义文件夹 ---------- */
+.folder-heading { display: flex; align-items: center; gap: 8px; padding-bottom: 4px; }
+.folder-heading > span { margin-right: auto; }
+.folder-heading .link-btn { font-size: 10px; letter-spacing: 0; }
+.folder-tree { margin-bottom: 22px; flex-shrink: 0; }
+.folder-row { display: flex; align-items: center; border-radius: 6px; min-height: 31px; }
+.folder-row:hover, .folder-select:hover { background: var(--hover); }
+.folder-row.active, .folder-select.active { background: var(--accent-soft); color: var(--accent); }
+.folder-icon { border: 0; background: transparent; color: var(--ink3); cursor: pointer; padding: 3px; flex-shrink: 0; min-width: 20px; border-radius: 4px; }
+.folder-icon:hover { color: var(--ink); background: var(--card2); }
+.folder-icon:disabled { cursor: default; opacity: .4; }
+.folder-select { border: 0; background: transparent; color: var(--ink2); display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1; text-align: left; font: inherit; font-size: 12px; cursor: pointer; padding: 6px 2px; border-radius: 5px; }
+.folder-select > svg { flex-shrink: 0; color: var(--accent); }
+.folder-select > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-select > em { font-style: normal; color: var(--ink3); font-size: 10px; margin-left: auto; }
+.folder-select.unfiled { width: 100%; padding: 7px 9px; }
+.folder-menu { opacity: 0; }
+.folder-row:hover .folder-menu, .folder-row:focus-within .folder-menu { opacity: 1; }
+.folder-hint { font-size: 12px; line-height: 1.7; color: var(--ink2); margin: 8px 0 14px; }
+.folder-tree > .folder-hint { font-size: 11px; padding: 0 9px; }
+.folder-dialog { background: var(--detail); border: 1px solid var(--line); border-radius: 14px; padding: 24px; width: min(440px, calc(100vw - 48px)); max-height: calc(100vh - 64px); overflow: auto; color: var(--ink); }
+.folder-dialog h2 { font-size: 18px; margin: 0 0 18px; }
+.folder-dialog label { display: flex; flex-direction: column; gap: 7px; font-size: 12px; color: var(--ink2); margin-bottom: 16px; }
+.folder-dialog input, .folder-dialog select, .folder-picker select { background: var(--field); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 9px; min-width: 0; width: 100%; font: inherit; }
+.folder-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.folder-dialog-actions .danger { margin-right: auto; }
+.folder-error { color: var(--err); background: var(--err-bg); border: 1px solid var(--err-line); border-radius: 6px; padding: 10px; font-size: 12px; }
+.folder-picker { display: flex; align-items: center; gap: 12px; color: var(--ink2); font-size: 12px; margin: 14px 0; }
+.folder-picker select { width: auto; max-width: 100%; flex: 1; }
+.organize-dialog { width: min(680px, calc(100vw - 48px)); }
+.organize-preview { max-height: 45vh; overflow-y: auto; border-top: 1px solid var(--line); padding: 12px 4px 0 0; }
+.organize-preview label > span { color: var(--ink); line-height: 1.5; }

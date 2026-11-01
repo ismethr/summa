@@ -1,18 +1,21 @@
 import { useState } from "react";
-import type { Paper } from "./types";
+import type { Folder, Paper } from "./types";
+import FolderPicker from "./FolderPicker";
 import type { PaperChanges } from "./Detail";
 
 type Props = {
   papers: Paper[];
   allTopics: string[];
   canDelete: boolean;
+  folders: Folder[];
+  onMove: (id: string) => void;
   onPatch: (changes: PaperChanges | ((p: Paper) => PaperChanges)) => void;
   onDelete: () => void;
   onClear: () => void;
 };
 
 /** 多选时右侧显示的批量操作面板 */
-export default function BulkPanel({ papers, allTopics, canDelete, onPatch, onDelete, onClear }: Props) {
+export default function BulkPanel({ papers, allTopics, canDelete, folders, onMove, onPatch, onDelete, onClear }: Props) {
   const [tag, setTag] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const n = papers.length;
@@ -34,6 +37,10 @@ export default function BulkPanel({ papers, allTopics, canDelete, onPatch, onDel
         </button>
       </div>
 
+      <section>
+        <h2 className="sec">整理到文件夹</h2>
+        <FolderPicker folders={folders} value="__choose__" onChange={onMove} bulk />
+      </section>
       <section>
         <h2 className="sec">阅读状态</h2>
         <div className="bulk-row">

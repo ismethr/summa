@@ -15,6 +15,7 @@ export type Paper = {
   venue: string;
   year: number;
   tags: string[];
+  folder_id?: string;
   gist: string;
   problem: string;
   steps: Step[];
@@ -47,7 +48,18 @@ export type Settings = {
 
 export type Library = {
   papers: Paper[];
+  folders?: Folder[];
 };
+
+export type Folder = {
+  id: string;
+  name: string;
+  parent_id: string;
+  rev: number;
+  deleted: boolean;
+};
+
+export type Placement = { paper_id: string; path: string[]; previous_folder_id: string };
 
 export type SyncSettings = {
   enabled: boolean;

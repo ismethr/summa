@@ -2,13 +2,16 @@ import { type MouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import type { ImportResult, Library, Paper, Settings, SyncReport, SyncSettings } from "./types";
-import { renderPdf } from "./parse";
+import type { Folder, ImportResult, Library, Paper, Placement, Settings, SyncReport, SyncSettings } from "./types";
 import SettingsDialog from "./Settings";
 import Detail, { type PaperChanges } from "./Detail";
 import BulkPanel from "./BulkPanel";
 import { useTheme } from "./theme";
 import sample from "./sample.json";
+import { matchesSearch, paperSearchText, searchWords } from "./search";
+import FolderSidebar from "./FolderSidebar";
+import OrganizeDialog from "./OrganizeDialog";
+import { folderDescendants, folderRows } from "./folders";
 
 const COLORS = ["#C4795F", "#7FB08A", "#7C9CC4", "#C4A85E", "#A48FB4", "#6E6E7A"];
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -42,15 +45,11 @@ function lastSyncText(ts: number) {
   return `${Math.floor(d / 86400_000)} 天前`;
 }
 
-/** 搜索时比对的文本：题名、作者、期刊、主题、要旨、方法、笔记 */
-function haystack(p: Paper) {
-  return [p.title, p.authors, p.venue, String(p.year || ""), p.gist, p.note ?? "", ...p.tags, ...p.steps.map((s) => s.name)]
-    .join(" ")
-    .toLowerCase();
-}
-
 export default function App() {
   const [papers, setPapers] = useState<Paper[]>([]);
+  const [folders, setFolders] = useState<Folder[]>([]);
+  const [folderId, setFolderId] = useState("");
+  const [showOrganize, setShowOrganize] = useState(false);
   const [activeId, setActiveId] = useState("");
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState("");
@@ -77,10 +76,15 @@ export default function App() {
   const queue = useRef<string[]>([]);
   const busy = useRef(false);
 
+  function acceptLibrary(data: Library) {
+    setPapers(data.papers ?? []);
+    setFolders(data.folders ?? []);
+  }
+
   useEffect(() => {
     if (!isTauri) {
       const data = sample as Library;
-      setPapers(data.papers ?? []);
+      acceptLibrary(data);
       setActiveId(data.papers?.[0]?.id ?? "");
       setStatus("ready");
       return;
@@ -88,7 +92,7 @@ export default function App() {
     invoke<Settings>("get_settings").then(setSettings).catch(() => {});
     invoke<Library>("load_library")
       .then((data) => {
-        setPapers(data.papers ?? []);
+        acceptLibrary(data);
         setActiveId(data.papers?.[0]?.id ?? "");
         setStatus("ready");
       })
@@ -102,11 +106,12 @@ export default function App() {
   useEffect(() => {
     if (!isTauri || status !== "ready") return;
     let alive = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     async function check() {
       try {
         const r = await invoke<ImportResult>("import_inbox");
         if (!alive) return;
-        if (r.library) setPapers(r.library.papers);
+        if (r.library) acceptLibrary(r.library);
         const parts = [];
         if (r.created.length) parts.push(`新增 ${r.created.length} 篇`);
         if (r.updated.length) parts.push(`更新 ${r.updated.length} 篇`);
@@ -116,17 +121,21 @@ export default function App() {
           setToast(`已从外部工具导入：${parts.join("，")}` + (names.length === 1 ? `《${names[0]}》` : ""));
           if (r.created.length) {
             setView("all");
+            setFolderId("");
             setTopic("");
             setQuery("");
           }
         }
       } catch {}
+      finally {
+        // 上一次导入完成后再计时，避免大批量导入时请求堆积。
+        if (alive) timer = setTimeout(check, 3000);
+      }
     }
     check();
-    const t = setInterval(check, 3000);
     return () => {
       alive = false;
-      clearInterval(t);
+      clearTimeout(timer);
     };
   }, [status]);
 
@@ -148,7 +157,7 @@ export default function App() {
     setSyncStage("正在连接");
     try {
       const r = await invoke<SyncReport>("sync_now");
-      if (r.library) setPapers(r.library.papers);
+      if (r.library) acceptLibrary(r.library);
       setSync(await invoke<SyncSettings>("get_sync_settings"));
       // 静默同步（启动时自动跑）只在真有变化时提示，
       // 否则每次开应用都弹一句"已是最新"，很快就会变成噪音
@@ -220,6 +229,7 @@ export default function App() {
       const bytes = await invoke<ArrayBuffer>("read_pdf", { path });
       step("渲染页面", 12);
 
+      const { renderPdf } = await import("./parse");
       const pages = await renderPdf(bytes, 12, (i, n) => {
         step(`渲染第 ${i} / ${n} 页`, 12 + Math.round((i / n) * 58));
       });
@@ -233,6 +243,7 @@ export default function App() {
       setQuery("");
       setTopic("");
       setView("all");
+      setFolderId("");
       return true;
     } catch (e) {
       const msg = String(e);
@@ -255,6 +266,7 @@ export default function App() {
 
   useEffect(() => {
     if (!isTauri) return;
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     getCurrentWebview()
       .onDragDropEvent((event) => {
@@ -270,9 +282,16 @@ export default function App() {
         }
       })
       .then((fn) => {
-        unlisten = fn;
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch((e) => {
+        if (!disposed) setToast(`无法接收拖入文件：${String(e)}`);
       });
-    return () => unlisten?.();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   // ---------- 派生数据 ----------
@@ -288,13 +307,26 @@ export default function App() {
     [papers]
   );
 
+  // 文献变化时建立索引；输入查询、切换筛选和排序时复用。
+  const searchIndex = useMemo(
+    () => papers.map((p, i) => ({ p, i, text: paperSearchText(p) })),
+    [papers]
+  );
+
+  const directoryRows = useMemo(() => folderRows(folders), [folders]);
+  const directoryIds = useMemo(() => new Set(directoryRows.map((r) => r.folder.id)), [directoryRows]);
+  const includedFolderIds = useMemo(() => folderDescendants(directoryRows, folderId), [directoryRows, folderId]);
+  useEffect(() => {
+    if (folderId && folderId !== "__unfiled__" && !directoryIds.has(folderId)) setFolderId("");
+  }, [folderId, directoryIds]);
+
   const shown = useMemo(() => {
-    const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
-    const list = papers
-      .map((p, i) => ({ p, i }))
+    const words = searchWords(query);
+    const list = searchIndex
       .filter(
-        ({ p }) =>
-          inView(p, view) && (!topic || p.tags.includes(topic)) && words.every((w) => haystack(p).includes(w))
+        ({ p, text }) =>
+          inView(p, view) && (!topic || p.tags.includes(topic)) && matchesSearch(text, words) &&
+          (!folderId || (folderId === "__unfiled__" ? !directoryIds.has(p.folder_id ?? "") : includedFolderIds.has(p.folder_id ?? "")))
       );
     list.sort((a, b) => {
       if (sort === "year") return (b.p.year || 0) - (a.p.year || 0) || a.i - b.i;
@@ -303,7 +335,7 @@ export default function App() {
       return (b.p.added ?? 0) - (a.p.added ?? 0) || a.i - b.i;
     });
     return list.map(({ p }) => p);
-  }, [papers, query, topic, view, sort]);
+  }, [searchIndex, query, topic, view, sort, folderId, directoryIds, includedFolderIds]);
 
   const active = papers.find((p) => p.id === activeId) ?? null;
 
@@ -323,7 +355,7 @@ export default function App() {
         return;
       }
       const tag = (e.target as HTMLElement).tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || job || showSettings) return;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || job || showSettings || showOrganize) return;
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a") {
         e.preventDefault();
         setSelected(new Set(shown.map((p) => p.id)));
@@ -344,7 +376,7 @@ export default function App() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [shown, activeId, job, showSettings]);
+  }, [shown, activeId, job, showSettings, showOrganize]);
 
   // 当前文献滚动到可见范围
   useEffect(() => {
@@ -415,7 +447,7 @@ export default function App() {
     }
     try {
       const lib = await invoke<Library>("delete_tag", { name });
-      setPapers(lib.papers);
+      acceptLibrary(lib);
     } catch (e) {
       showError("删除主题", e);
     }
@@ -443,7 +475,7 @@ export default function App() {
     if (isTauri) {
       try {
         const lib = await invoke<Library>("rename_tag", { from, to: name });
-        setPapers(lib.papers);
+        acceptLibrary(lib);
       } catch (e) {
         showError("重命名主题", e);
         return;
@@ -454,9 +486,48 @@ export default function App() {
     if (topic === from) setTopic(name);
   }
 
+  async function saveFolder(id: string | null, name: string, parentId: string) {
+    if (isTauri) {
+      acceptLibrary(await invoke<Library>("save_folder", { id, name, parentId }));
+      return;
+    }
+    name = name.trim();
+    if (!name || [...name].length > 60 || /[\p{Cc}/]/u.test(name)) throw new Error("文件夹名称需为 1–60 个字符，不能含换行或 /");
+    if (parentId && !directoryIds.has(parentId)) throw new Error("上级文件夹已不存在");
+    if (id && folderDescendants(directoryRows, id).has(parentId)) throw new Error("不能移入自身或其子文件夹");
+    if (folders.some((f) => !f.deleted && f.id !== id && f.parent_id === parentId && f.name === name)) throw new Error("同一层级已有同名文件夹");
+    const next: Folder = { id: id ?? `f${crypto.randomUUID()}`, name, parent_id: parentId, rev: Date.now(), deleted: false };
+    setFolders((prev) => id ? prev.map((f) => f.id === id ? next : f) : [...prev, next]);
+  }
+
+  async function deleteFolder(id: string) {
+    if (isTauri) acceptLibrary(await invoke<Library>("delete_folder", { id }));
+    else {
+      const gone = folderDescendants(directoryRows, id);
+      setFolders((prev) => prev.map((f) => gone.has(f.id) ? { ...f, deleted: true, rev: Date.now() } : f));
+      setPapers((prev) => prev.map((p) => gone.has(p.folder_id ?? "") ? { ...p, folder_id: "" } : p));
+    }
+  }
+
+  async function moveToFolder(ids: string[], destination: string) {
+    try {
+      if (isTauri) acceptLibrary(await invoke<Library>("move_papers", { ids, folderId: destination }));
+      else setPapers((prev) => prev.map((p) => ids.includes(p.id) ? { ...p, folder_id: destination } : p));
+      setSelected(new Set());
+      setToast(`已移动 ${ids.length} 篇文献`);
+    } catch (e) { showError("移动文献", e); }
+  }
+
+  async function applyFolderPlan(plan: Placement[]) {
+    acceptLibrary(await invoke<Library>("apply_folder_plan", { plan }));
+    setFolderId(""); setView("all"); setTopic(""); setQuery(""); setSelected(new Set());
+    setToast(`已整理 ${plan.length} 篇文献`);
+  }
+
   const noKey = isTauri && settings !== null && !settings.has_key;
-  const listTitle = topic || VIEWS.find((v) => v.id === view)!.label;
-  const filtered = view !== "all" || topic || query.trim();
+  const directoryTitle = folderId === "__unfiled__" ? "未归档" : directoryRows.find((r) => r.folder.id === folderId)?.path;
+  const listTitle = directoryTitle || topic || VIEWS.find((v) => v.id === view)!.label;
+  const filtered = view !== "all" || topic || query.trim() || folderId;
 
   return (
     <div className="app">
@@ -524,16 +595,22 @@ export default function App() {
             {VIEWS.map((v) => (
               <div
                 key={v.id}
-                className={"nav-item" + (view === v.id && !topic ? " active" : "")}
+                className={"nav-item" + (view === v.id && !topic && !folderId ? " active" : "")}
                 onClick={() => {
                   setView(v.id);
                   setTopic("");
+                  setFolderId("");
+                  setSelected(new Set());
                 }}
               >
                 {v.label} <span>{viewCounts[v.id]}</span>
               </div>
             ))}
           </nav>
+
+          <FolderSidebar folders={folders} papers={papers} active={folderId}
+            onSelect={(id) => { setFolderId(id); setTopic(""); setView("all"); setSelected(new Set()); }}
+            onSave={saveFolder} onDelete={deleteFolder} onAI={() => setShowOrganize(true)} />
 
           <div className="side-label" title="双击主题可重命名；改成已有的名字即合并">
             主题
@@ -641,6 +718,7 @@ export default function App() {
                   className="link-btn"
                   onClick={() => {
                     setView("all");
+                    setFolderId("");
                     setTopic("");
                     setQuery("");
                   }}
@@ -696,6 +774,8 @@ export default function App() {
               papers={papers.filter((p) => selected.has(p.id))}
               allTopics={topics.map(([t]) => t)}
               canDelete={isTauri}
+              folders={folders}
+              onMove={(id) => moveToFolder([...selected], id)}
               onPatch={bulkPatch}
               onDelete={() => removePapers([...selected])}
               onClear={() => setSelected(new Set())}
@@ -706,6 +786,8 @@ export default function App() {
               paper={active}
               allTopics={topics.map(([t]) => t)}
               canFile={isTauri}
+              folders={folders}
+              onMove={(id) => moveToFolder([active.id], id)}
               onPatch={(c) => patch(active.id, c)}
               onOpen={openActive}
               onDelete={() => removePapers([active.id])}
@@ -747,6 +829,8 @@ export default function App() {
         </div>
       )}
 
+      {showOrganize && <OrganizeDialog papers={papers} folders={folders} selected={selected}
+        canAI={isTauri && !!settings?.has_key} onApply={applyFolderPlan} onClose={() => setShowOrganize(false)} />}
       {showSettings && settings && (
         <SettingsDialog
           settings={settings}

@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
 mod sync;
+mod folders;
 
 const MAX_PAGES: usize = 12;
 /// DeepSeek 官方说明：deepseek-flash 即 V4.1 Flash，支持图像输入；v4-pro 不支持图像
@@ -118,6 +119,9 @@ pub struct Paper {
     pub year: i32,
     #[serde(default, deserialize_with = "lenient_tags")]
     pub tags: Vec<String>,
+    /// 用户自定义的文件夹；空字符串表示未归档。
+    #[serde(default)]
+    pub folder_id: String,
     #[serde(default, deserialize_with = "lenient_string")]
     pub gist: String,
     #[serde(default, deserialize_with = "lenient_string")]
@@ -160,6 +164,7 @@ pub struct Paper {
 /// 界面上可以手动修改的字段；None 表示不改
 #[derive(Deserialize)]
 pub struct PaperPatch {
+    folder_id: Option<String>,
     tags: Option<Vec<String>>,
     read: Option<bool>,
     starred: Option<bool>,
@@ -170,6 +175,8 @@ pub struct PaperPatch {
 pub(crate) struct Library {
     #[serde(default)]
     pub(crate) papers: Vec<Paper>,
+    #[serde(default)]
+    pub(crate) folders: Vec<folders::Folder>,
 }
 
 // ---------- 工具 ----------
@@ -408,6 +415,7 @@ async fn parse_pdf(
         paper.read = old.read;
         paper.starred = old.starred;
         paper.note = old.note.clone();
+        paper.folder_id = old.folder_id.clone();
     }
 
     let files = data_dir(&app)?.join("files");
@@ -453,7 +461,13 @@ fn update_paper(app: tauri::AppHandle, id: String, patch: PaperPatch) -> Result<
     let _guard = LIBRARY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut lib = read_library(&app)?;
     let old = lib.clone();
+    if let Some(ref folder_id) = patch.folder_id {
+        folders::validate_destination(&lib, folder_id)?;
+    }
     let paper = lib.papers.iter_mut().find(|p| p.id == id).ok_or("找不到这篇文献")?;
+    if let Some(v) = patch.folder_id {
+        paper.folder_id = v;
+    }
     if let Some(tags) = patch.tags {
         let mut clean: Vec<String> = Vec::new();
         for t in tags.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
@@ -1008,6 +1022,11 @@ pub fn run() {
             import_inbox,
             update_paper,
             rename_tag,
+            folders::save_folder,
+            folders::delete_folder,
+            folders::move_papers,
+            folders::suggest_folders,
+            folders::apply_folder_plan,
             open_paper,
             get_settings,
             save_settings,

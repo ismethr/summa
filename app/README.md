@@ -47,9 +47,13 @@ npm run dev        # 浏览器打开 http://localhost:1420
 **测试**：
 
 ```bash
-cd src-tauri && cargo test --lib     # 模型输出容错、外部导入字段转换、合并规则
+(cd src-tauri && cargo test --lib)   # 模型输出容错、外部导入字段转换、合并规则
+npm test                             # 前端检索回归测试
 npm run build                        # 前端类型检查 + 构建
 ```
+
+前端检索回归测试在 `app/` 下运行 `npm test`，使用现有 TypeScript 编译器和 Node 内置测试运行器，无需额外依赖。
+搜索覆盖题名、作者、期刊、年份、主题、要义页各节、笔记、DOI 和导入来源；多个关键词需全部命中，支持大小写及全角字符规范化。
 
 ## 架构
 
@@ -86,9 +90,14 @@ app/
 │   ├── App.tsx          主界面：标题栏、侧栏、列表、筛选排序、多选、拖入队列、收件箱轮询、快捷键
 │   ├── Detail.tsx       要义页：星标、已读、复制引用、主题编辑、笔记自动保存
 │   ├── BulkPanel.tsx    多选后的批量操作面板
+│   ├── FolderSidebar.tsx 自定义目录树和管理弹窗
+│   ├── FolderPicker.tsx 单篇和批量归档选择器
+│   ├── OrganizeDialog.tsx AI 目录方案的生成、预览和应用
+│   ├── folders.ts       树构建、路径和后代筛选，兼容孤立目录与环
 │   ├── Settings.tsx     设置窗口：外观、API Key、模型、测试连接
 │   ├── theme.ts         日间 / 夜间 / 跟随系统，同步窗口外观
 │   ├── parse.ts         PDF.js 渲染；改页面宽度、JPEG 质量在这里
+│   ├── search.ts        检索文本索引、字符规范化、多关键词匹配
 │   ├── types.ts         前端数据类型，与 Rust 的 Paper 对应
 │   ├── styles.css       全部样式，顶部是两套颜色变量
 │   └── sample.json      浏览器预览用的样例
@@ -96,6 +105,7 @@ app/
 └── src-tauri/
     ├── src/lib.rs       ★ 数据结构、命令、模型调用、导入、测试
     ├── src/sync.rs      WebDAV 同步：合并规则、HTTP、PDF 传输
+    ├── src/folders.rs   文件夹写入、批量归档、AI 方案校验与应用
     ├── tauri.conf.json  窗口、打包、版本号
     ├── capabilities/    前端可调用的系统权限
     ├── Cargo.toml       Rust 依赖
@@ -123,6 +133,7 @@ app/
 | `title` `authors` `venue` | string | `authors` 是逗号分隔的字符串 |
 | `year` | number | 未知为 0 |
 | `tags` | string[] | 主题 |
+| `folder_id` | string | 自定义目录 id，空表示未归档；旧记录默认空 |
 | `gist` | string | 一句话要旨 |
 | `problem` | string | 研究问题 |
 | `steps` | `{name, detail}[]` | 方法路径 |
@@ -139,6 +150,8 @@ app/
 
 所有字段都带 `#[serde(default)]`，旧版本写的 `library.json` 缺字段也能读。模型返回的字段用 `lenient_*` 系列函数宽容解析：`null`、数字、数组形式的作者、`"2025年"` 这类年份都能正确转换。
 
+`Library.folders` 默认为空数组，记录 `{id, name, parent_id, rev, deleted}`。目录名称同层唯一，删除以 `deleted` 保留记录，防止旧设备将目录复活。文献重新解析或外部导入合并时保留用户的 `folder_id`。
+
 ## Rust 命令
 
 同步相关命令在 `src-tauri/src/sync.rs`，其余在 `lib.rs`。前端用 `invoke("命令名", { 参数 })` 调用（参数名 Rust 用 snake_case，前端用 camelCase，Tauri 自动转换）。
@@ -149,6 +162,11 @@ app/
 | `read_pdf` | `path` | 二进制 | 读 PDF，限 80 MB；用 `ipc::Response` 直接传字节 |
 | `parse_pdf` | `path, fileName, pages` | `Paper` | 调模型解析，复制 PDF，入库；同一 `path` 覆盖旧记录并保留用户字段。未配 Key 返回错误 `NO_KEY` |
 | `update_paper` | `id, patch` | `Paper` | 改 `tags` / `read` / `starred` / `note`，未给的字段不变 |
+| `save_folder` | `id, name, parentId` | `Library` | `id` 为 null 时新建；否则改名或移动，校验循环和重名 |
+| `delete_folder` | `id` | `Library` | 移除目录及后代，保留文献并归回未归档 |
+| `move_papers` | `ids, folderId` | `Library` | 原子批量移动；空 folderId 为未归档 |
+| `suggest_folders` | `ids` | `Placement[]` | 最多 200 篇，仅用题录和要义文本请求 DeepSeek，不写库 |
+| `apply_folder_plan` | `plan` | `Library` | 校验文献存在、归属未变化和路径后，原子应用完整方案 |
 | `delete_papers` | `ids` | — | 删除记录和库内 PDF 副本 |
 | `rename_tag` | `from, to` | `Library` | 全库重命名主题，`to` 已存在即合并 |
 | `delete_tag` | `name` | `Library` | 从所有文献上移除主题 |
